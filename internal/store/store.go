@@ -52,6 +52,37 @@ type Exchange struct {
 	ResponseBytes    int64     `json:"response_bytes"`
 }
 
+type TokenRun struct {
+	ExchangeID       string    `json:"exchange_id"`
+	Side             string    `json:"side"`
+	Tokenizer        string    `json:"tokenizer"`
+	TokenCount       int       `json:"token_count"`
+	UniqueTokenCount int       `json:"unique_token_count"`
+	ByteCount        int64     `json:"byte_count"`
+	CharCount        int64     `json:"char_count"`
+	DigestSHA256     string    `json:"digest_sha256"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type TokenValue struct {
+	ExchangeID    string `json:"exchange_id"`
+	Side          string `json:"side"`
+	Tokenizer     string `json:"tokenizer"`
+	TokenHash     string `json:"token_hash"`
+	Occurrences   int    `json:"occurrences"`
+	FirstPosition int    `json:"first_position"`
+}
+
+type TokenReport struct {
+	Runs   []TokenRun   `json:"runs"`
+	Values []TokenValue `json:"values"`
+}
+
+type TokenTotals struct {
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+}
+
 type ListFilter struct {
 	Limit  int
 	Offset int
@@ -161,6 +192,32 @@ CREATE TABLE IF NOT EXISTS exchanges (
 CREATE INDEX IF NOT EXISTS idx_exchanges_started_at ON exchanges(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_exchanges_path ON exchanges(path);
 CREATE INDEX IF NOT EXISTS idx_exchanges_status_code ON exchanges(status_code);
+
+CREATE TABLE IF NOT EXISTS llm_token_runs (
+  exchange_id TEXT NOT NULL,
+  side TEXT NOT NULL,
+  tokenizer TEXT NOT NULL,
+  token_count INTEGER NOT NULL,
+  unique_token_count INTEGER NOT NULL,
+  byte_count INTEGER NOT NULL,
+  char_count INTEGER NOT NULL,
+  digest_sha256 TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (exchange_id, side, tokenizer)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_token_runs_updated_at ON llm_token_runs(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_token_runs_side ON llm_token_runs(side);
+
+CREATE TABLE IF NOT EXISTS llm_token_values (
+  exchange_id TEXT NOT NULL,
+  side TEXT NOT NULL,
+  tokenizer TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  occurrences INTEGER NOT NULL,
+  first_position INTEGER NOT NULL,
+  PRIMARY KEY (exchange_id, side, tokenizer, token_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_token_values_hash ON llm_token_values(token_hash);
 `)
 	return err
 }
@@ -307,7 +364,11 @@ func (c *Capture) Flush(errorMessage string) error {
 	ex := c.snapshotLocked(errorMessage, false)
 	c.mu.Unlock()
 
-	return c.store.Insert(context.Background(), ex)
+	ctx := context.Background()
+	if err := c.store.Insert(ctx, ex); err != nil {
+		return err
+	}
+	return c.store.ProcessExchangeTokens(ctx, ex, false)
 }
 
 func (c *Capture) Save(errorMessage string) error {
@@ -324,7 +385,11 @@ func (c *Capture) Save(errorMessage string) error {
 	ex := c.snapshotLocked(errorMessage, true)
 	c.mu.Unlock()
 
-	return c.store.Insert(context.Background(), ex)
+	ctx := context.Background()
+	if err := c.store.Insert(ctx, ex); err != nil {
+		return err
+	}
+	return c.store.ProcessExchangeTokens(ctx, ex, true)
 }
 
 func (c *Capture) snapshotLocked(errorMessage string, final bool) Exchange {

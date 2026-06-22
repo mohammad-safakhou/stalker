@@ -26,7 +26,8 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/":
 		http.Redirect(w, r, "/ui/", http.StatusFound)
 	case r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/") ||
-		r.URL.Path == "/api/exchanges" || strings.HasPrefix(r.URL.Path, "/api/exchanges/"):
+		r.URL.Path == "/api/exchanges" || strings.HasPrefix(r.URL.Path, "/api/exchanges/") ||
+		r.URL.Path == "/api/tokens/summary" || r.URL.Path == "/api/tokens/stream":
 		a.ui.ServeHTTP(w, r)
 	default:
 		a.proxy.ServeHTTP(w, r)

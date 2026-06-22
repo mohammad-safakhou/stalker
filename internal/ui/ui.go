@@ -2,11 +2,13 @@ package ui
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mohammad-safakhou/stalker/internal/store"
 )
@@ -25,6 +27,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.index(w, r)
 	case r.URL.Path == "/api/exchanges":
 		h.list(w, r)
+	case r.URL.Path == "/api/tokens/summary":
+		h.tokenSummary(w, r)
+	case r.URL.Path == "/api/tokens/stream":
+		h.tokenStream(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/exchanges/"):
 		h.exchange(w, r)
 	default:
@@ -52,9 +58,63 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, items)
 }
 
+func (h *Handler) tokenSummary(w http.ResponseWriter, r *http.Request) {
+	totals, err := h.Store.TokenTotals(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, totals)
+}
+
+func (h *Handler) tokenStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("streaming is not supported"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	send := func() bool {
+		totals, err := h.Store.TokenTotals(r.Context())
+		if err != nil {
+			_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", jsonString(map[string]string{"error": err.Error()}))
+			flusher.Flush()
+			return false
+		}
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", jsonString(totals))
+		flusher.Flush()
+		return true
+	}
+
+	if !send() {
+		return
+	}
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if !send() {
+				return
+			}
+		}
+	}
+}
+
 func (h *Handler) exchange(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/exchanges/")
 	parts := strings.Split(rest, "/")
+	if len(parts) == 2 && parts[1] == "tokens" {
+		h.tokens(w, r, parts[0])
+		return
+	}
 	if len(parts) == 3 && parts[1] == "body" {
 		h.body(w, r, parts[0], parts[2])
 		return
@@ -74,6 +134,16 @@ func (h *Handler) exchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, ex)
+}
+
+func (h *Handler) tokens(w http.ResponseWriter, r *http.Request, id string) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	report, err := h.Store.TokenReport(r.Context(), id, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, report)
 }
 
 func (h *Handler) body(w http.ResponseWriter, r *http.Request, id string, side string) {
@@ -113,6 +183,14 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 }
 
+func jsonString(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
 func FileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
@@ -125,8 +203,8 @@ const indexHTML = `<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Stalker</title>
   <style>
-    :root { color-scheme: light dark; --bg: #f7f7f4; --fg: #171717; --muted: #6b6b63; --line: #d8d6cf; --panel: #ffffff; --accent: #0f766e; --bad: #b42318; }
-    @media (prefers-color-scheme: dark) { :root { --bg: #141412; --fg: #eeeeea; --muted: #a7a59d; --line: #34342f; --panel: #1d1d1a; --accent: #2dd4bf; --bad: #ff8a80; } }
+    :root { color-scheme: light dark; --bg: #f7f7f4; --fg: #171717; --muted: #6b6b63; --line: #d8d6cf; --panel: #ffffff; --accent: #0f766e; --accent2: #7c3aed; --bad: #b42318; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #141412; --fg: #eeeeea; --muted: #a7a59d; --line: #34342f; --panel: #1d1d1a; --accent: #2dd4bf; --accent2: #a78bfa; --bad: #ff8a80; } }
     * { box-sizing: border-box; }
     body { margin: 0; font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); }
     header { height: 52px; display: flex; align-items: center; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
@@ -134,6 +212,15 @@ const indexHTML = `<!doctype html>
     input, button { font: inherit; }
     input { height: 32px; min-width: 280px; border: 1px solid var(--line); background: transparent; color: var(--fg); padding: 0 10px; border-radius: 6px; }
     button { height: 32px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 6px; padding: 0 10px; cursor: pointer; }
+    .spacer { flex: 1; }
+    .hidden { display: none !important; }
+    #dashboard { min-height: calc(100vh - 52px); display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .token-hero { width: min(920px, 100%); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .token-card { min-height: 260px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }
+    .token-card span { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0; }
+    .token-card b { display: block; margin-top: 10px; font-size: 72px; line-height: 1; letter-spacing: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; text-align: center; }
+    .token-card.input b { color: var(--accent); }
+    .token-card.output b { color: var(--accent2); }
     main { display: grid; grid-template-columns: minmax(360px, 42%) 1fr; height: calc(100vh - 52px); }
     #list { border-right: 1px solid var(--line); overflow: auto; background: var(--panel); }
     .row { display: grid; grid-template-columns: 70px 1fr 64px; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
@@ -156,26 +243,76 @@ const indexHTML = `<!doctype html>
     .msg b { display: block; margin-bottom: 4px; color: var(--accent); }
     .msg div { white-space: pre-wrap; word-break: break-word; }
     a { color: var(--accent); text-decoration: none; }
-    @media (max-width: 800px) { main { grid-template-columns: 1fr; } #list { height: 42vh; border-right: 0; border-bottom: 1px solid var(--line); } input { min-width: 0; flex: 1; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 800px) { .token-hero { grid-template-columns: 1fr; } .token-card { min-height: 180px; } .token-card b { font-size: 48px; } main { grid-template-columns: 1fr; } #list { height: 42vh; border-right: 0; border-bottom: 1px solid var(--line); } input { min-width: 0; flex: 1; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   </style>
 </head>
 <body>
   <header>
     <strong>Stalker</strong>
-    <input id="q" placeholder="Search path, route, body preview">
+    <input id="q" class="hidden" placeholder="Search path, route, body preview">
+    <span class="spacer"></span>
     <button id="refresh">Refresh</button>
+    <button id="viewToggle">Messages</button>
     <span id="count" class="meta"></span>
   </header>
-  <main>
+  <section id="dashboard">
+    <div class="token-hero">
+      <div class="token-card input"><span>Input tokens</span><b id="inputTokens">0</b></div>
+      <div class="token-card output"><span>Output tokens</span><b id="outputTokens">0</b></div>
+    </div>
+  </section>
+  <main id="explorer" class="hidden">
     <section id="list"><div class="empty">Loading...</div></section>
     <section id="detail"><div class="empty">Select a request.</div></section>
   </main>
   <script>
+    const dashboard = document.querySelector("#dashboard");
+    const explorer = document.querySelector("#explorer");
     const list = document.querySelector("#list");
     const detail = document.querySelector("#detail");
     const q = document.querySelector("#q");
     const count = document.querySelector("#count");
+    const viewToggle = document.querySelector("#viewToggle");
+    const inputTokens = document.querySelector("#inputTokens");
+    const outputTokens = document.querySelector("#outputTokens");
     let selected = "";
+    let view = "dashboard";
+    let tokenStream = null;
+
+    function applyTotals(totals) {
+      inputTokens.textContent = fmt(totals.input_tokens || 0);
+      outputTokens.textContent = fmt(totals.output_tokens || 0);
+      count.textContent = "";
+    }
+
+    async function loadDashboard() {
+      const res = await fetch("/api/tokens/summary");
+      const totals = await res.json();
+      applyTotals(totals);
+    }
+
+    function startTokenStream() {
+      stopTokenStream();
+      if (!window.EventSource) {
+        loadDashboard();
+        return;
+      }
+      tokenStream = new EventSource("/api/tokens/stream");
+      tokenStream.onmessage = event => {
+        try { applyTotals(JSON.parse(event.data)); } catch {}
+      };
+      tokenStream.onerror = () => {
+        stopTokenStream();
+        loadDashboard();
+      };
+    }
+
+    function stopTokenStream() {
+      if (tokenStream) {
+        tokenStream.close();
+        tokenStream = null;
+      }
+    }
 
     async function load() {
       const url = new URL("/api/exchanges", location.origin);
@@ -201,6 +338,30 @@ const indexHTML = `<!doctype html>
         el.onclick = () => select(row.id);
         list.appendChild(el);
       }
+    }
+
+    async function refresh() {
+      if (view === "dashboard") await loadDashboard();
+      else await load();
+    }
+
+    function showDashboard() {
+      view = "dashboard";
+      dashboard.classList.remove("hidden");
+      explorer.classList.add("hidden");
+      q.classList.add("hidden");
+      viewToggle.textContent = "Messages";
+      startTokenStream();
+    }
+
+    function showExplorer() {
+      view = "explorer";
+      stopTokenStream();
+      dashboard.classList.add("hidden");
+      explorer.classList.remove("hidden");
+      q.classList.remove("hidden");
+      viewToggle.textContent = "Dashboard";
+      load();
     }
 
     async function select(id) {
@@ -337,10 +498,15 @@ const indexHTML = `<!doctype html>
       return value.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
 
-    document.querySelector("#refresh").onclick = load;
+    function fmt(value) {
+      return new Intl.NumberFormat().format(value);
+    }
+
+    document.querySelector("#refresh").onclick = refresh;
+    viewToggle.onclick = () => view === "dashboard" ? showExplorer() : showDashboard();
     q.addEventListener("keydown", e => { if (e.key === "Enter") load(); });
-    load();
-    setInterval(load, 5000);
+    showDashboard();
+    setInterval(() => { if (view !== "dashboard") refresh(); }, 5000);
   </script>
 </body>
 </html>`

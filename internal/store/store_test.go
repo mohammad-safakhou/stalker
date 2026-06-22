@@ -131,6 +131,97 @@ func TestCaptureDecodesZstdPreviewAndBody(t *testing.T) {
 	}
 }
 
+func TestCaptureIndexesHashedInputOutputTokens(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	capture, err := s.NewCapture(CaptureMeta{
+		Method:    "POST",
+		Path:      "/v1/responses",
+		Route:     "chatgpt-codex-responses",
+		TargetURL: "https://chatgpt.com/backend-api/codex/responses",
+		Headers:   http.Header{"Content-Type": []string{"application/json"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqBody := capture.RequestBody(io.NopCloser(strings.NewReader(`{"input":"alpha alpha beta"}`)))
+	if _, err := io.Copy(io.Discard, reqBody); err != nil {
+		t.Fatal(err)
+	}
+	if err := reqBody.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	respBody := capture.ResponseBody(
+		io.NopCloser(strings.NewReader(`{"output":[{"content":"gamma"}]}`)),
+		http.StatusOK,
+		http.Header{"Content-Type": []string{"application/json"}},
+		false,
+	)
+	if _, err := io.Copy(io.Discard, respBody); err != nil {
+		t.Fatal(err)
+	}
+	if err := respBody.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := s.List(context.Background(), ListFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := s.TokenReport(context.Background(), items[0].ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Runs) != 2 {
+		t.Fatalf("token runs = %d, want input and output", len(report.Runs))
+	}
+	var inputRun TokenRun
+	for _, run := range report.Runs {
+		if run.Side == "input" {
+			inputRun = run
+		}
+	}
+	if inputRun.Tokenizer != tokenizerVersion {
+		t.Fatalf("input tokenizer = %q, want %q", inputRun.Tokenizer, tokenizerVersion)
+	}
+	if inputRun.TokenCount == 0 || inputRun.UniqueTokenCount == 0 || inputRun.DigestSHA256 == "" {
+		t.Fatalf("input token run not populated: %+v", inputRun)
+	}
+	alphaHash := hashToken("alpha")
+	var foundAlpha bool
+	for _, value := range report.Values {
+		if value.Side == "input" && value.TokenHash == alphaHash {
+			foundAlpha = true
+			if value.Occurrences != 2 {
+				t.Fatalf("alpha occurrences = %d, want 2", value.Occurrences)
+			}
+		}
+		if strings.Contains(value.TokenHash, "alpha") || strings.Contains(value.TokenHash, "gamma") {
+			t.Fatalf("token hash leaks raw text: %+v", value)
+		}
+	}
+	if !foundAlpha {
+		t.Fatal("hashed alpha token was not indexed")
+	}
+
+	totals, err := s.TokenTotals(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals.InputTokens == 0 {
+		t.Fatalf("input total = %d, want non-zero", totals.InputTokens)
+	}
+	if totals.OutputTokens == 0 {
+		t.Fatalf("output total = %d, want non-zero", totals.OutputTokens)
+	}
+}
+
 func zstdBytes(t *testing.T, raw string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
