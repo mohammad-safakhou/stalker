@@ -68,9 +68,22 @@ type TokenValue struct {
 	ExchangeID    string `json:"exchange_id"`
 	Side          string `json:"side"`
 	Tokenizer     string `json:"tokenizer"`
+	Token         string `json:"token"`
 	TokenHash     string `json:"token_hash"`
 	Occurrences   int    `json:"occurrences"`
 	FirstPosition int    `json:"first_position"`
+}
+
+type TokenBurn struct {
+	Side        string `json:"side"`
+	Token       string `json:"token"`
+	TokenHash   string `json:"token_hash"`
+	Occurrences int64  `json:"occurrences"`
+}
+
+type TokenBurns struct {
+	Input  []TokenBurn `json:"input"`
+	Output []TokenBurn `json:"output"`
 }
 
 type TokenReport struct {
@@ -79,8 +92,9 @@ type TokenReport struct {
 }
 
 type TokenTotals struct {
-	InputTokens  int64 `json:"input_tokens"`
-	OutputTokens int64 `json:"output_tokens"`
+	InputTokens  int64      `json:"input_tokens"`
+	OutputTokens int64      `json:"output_tokens"`
+	Top          TokenBurns `json:"top"`
 }
 
 type ListFilter struct {
@@ -212,6 +226,7 @@ CREATE TABLE IF NOT EXISTS llm_token_values (
   exchange_id TEXT NOT NULL,
   side TEXT NOT NULL,
   tokenizer TEXT NOT NULL,
+  token_value TEXT NOT NULL DEFAULT '',
   token_hash TEXT NOT NULL,
   occurrences INTEGER NOT NULL,
   first_position INTEGER NOT NULL,
@@ -219,7 +234,45 @@ CREATE TABLE IF NOT EXISTS llm_token_values (
 );
 CREATE INDEX IF NOT EXISTS idx_llm_token_values_hash ON llm_token_values(token_hash);
 `)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.ensureTokenValueColumns(ctx)
+}
+
+func (s *Store) ensureTokenValueColumns(ctx context.Context) error {
+	hasTokenValue, err := s.hasColumn(ctx, "llm_token_values", "token_value")
+	if err != nil {
+		return err
+	}
+	if !hasTokenValue {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE llm_token_values ADD COLUMN token_value TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if strings.EqualFold(name, column) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) NewCapture(meta CaptureMeta) (*Capture, error) {

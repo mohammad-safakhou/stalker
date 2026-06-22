@@ -214,13 +214,19 @@ const indexHTML = `<!doctype html>
     button { height: 32px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 6px; padding: 0 10px; cursor: pointer; }
     .spacer { flex: 1; }
     .hidden { display: none !important; }
-    #dashboard { min-height: calc(100vh - 52px); display: flex; align-items: center; justify-content: center; padding: 24px; }
-    .token-hero { width: min(920px, 100%); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-    .token-card { min-height: 260px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }
-    .token-card span { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0; }
-    .token-card b { display: block; margin-top: 10px; font-size: 72px; line-height: 1; letter-spacing: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; text-align: center; }
-    .token-card.input b { color: var(--accent); }
-    .token-card.output b { color: var(--accent2); }
+    #dashboard { min-height: calc(100vh - 52px); padding: 18px; }
+    .token-hero { height: calc(100vh - 88px); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .token-column { min-width: 0; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); display: grid; grid-template-rows: minmax(190px, 34%) 1fr; overflow: hidden; }
+    .token-total { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 18px; border-bottom: 1px solid var(--line); }
+    .token-total span { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0; }
+    .token-total b { display: block; margin-top: 10px; font-size: 72px; line-height: 1; letter-spacing: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; text-align: center; }
+    .input .token-total b { color: var(--accent); }
+    .output .token-total b { color: var(--accent2); }
+    .burn-list { overflow: auto; padding: 12px; }
+    .burn-list h2 { margin: 0 0 10px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0; }
+    .burn-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 12px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--line); }
+    .burn-row code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 13px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--fg); }
+    .burn-row b { font-variant-numeric: tabular-nums; font-size: 13px; }
     main { display: grid; grid-template-columns: minmax(360px, 42%) 1fr; height: calc(100vh - 52px); }
     #list { border-right: 1px solid var(--line); overflow: auto; background: var(--panel); }
     .row { display: grid; grid-template-columns: 70px 1fr 64px; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
@@ -243,7 +249,7 @@ const indexHTML = `<!doctype html>
     .msg b { display: block; margin-bottom: 4px; color: var(--accent); }
     .msg div { white-space: pre-wrap; word-break: break-word; }
     a { color: var(--accent); text-decoration: none; }
-    @media (max-width: 800px) { .token-hero { grid-template-columns: 1fr; } .token-card { min-height: 180px; } .token-card b { font-size: 48px; } main { grid-template-columns: 1fr; } #list { height: 42vh; border-right: 0; border-bottom: 1px solid var(--line); } input { min-width: 0; flex: 1; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 800px) { #dashboard { padding: 12px; } .token-hero { height: auto; grid-template-columns: 1fr; } .token-column { min-height: 460px; } .token-total b { font-size: 48px; } main { grid-template-columns: 1fr; } #list { height: 42vh; border-right: 0; border-bottom: 1px solid var(--line); } input { min-width: 0; flex: 1; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   </style>
 </head>
 <body>
@@ -257,8 +263,14 @@ const indexHTML = `<!doctype html>
   </header>
   <section id="dashboard">
     <div class="token-hero">
-      <div class="token-card input"><span>Input tokens</span><b id="inputTokens">0</b></div>
-      <div class="token-card output"><span>Output tokens</span><b id="outputTokens">0</b></div>
+      <section class="token-column input">
+        <div class="token-total"><span>Input tokens</span><b id="inputTokens">0</b></div>
+        <div class="burn-list"><h2>Top input tokens burned</h2><div id="inputTop"></div></div>
+      </section>
+      <section class="token-column output">
+        <div class="token-total"><span>Output tokens</span><b id="outputTokens">0</b></div>
+        <div class="burn-list"><h2>Top output tokens burned</h2><div id="outputTop"></div></div>
+      </section>
     </div>
   </section>
   <main id="explorer" class="hidden">
@@ -275,6 +287,8 @@ const indexHTML = `<!doctype html>
     const viewToggle = document.querySelector("#viewToggle");
     const inputTokens = document.querySelector("#inputTokens");
     const outputTokens = document.querySelector("#outputTokens");
+    const inputTop = document.querySelector("#inputTop");
+    const outputTop = document.querySelector("#outputTop");
     let selected = "";
     let view = "dashboard";
     let tokenStream = null;
@@ -282,6 +296,8 @@ const indexHTML = `<!doctype html>
     function applyTotals(totals) {
       inputTokens.textContent = fmt(totals.input_tokens || 0);
       outputTokens.textContent = fmt(totals.output_tokens || 0);
+      renderTop(inputTop, totals.top && totals.top.input || []);
+      renderTop(outputTop, totals.top && totals.top.output || []);
       count.textContent = "";
     }
 
@@ -500,6 +516,31 @@ const indexHTML = `<!doctype html>
 
     function fmt(value) {
       return new Intl.NumberFormat().format(value);
+    }
+
+    function renderTop(target, rows) {
+      target.innerHTML = "";
+      if (!rows.length) {
+        target.innerHTML = '<div class="empty">No token data yet.</div>';
+        return;
+      }
+      for (const row of rows) {
+        const el = document.createElement("div");
+        el.className = "burn-row";
+        const token = document.createElement("code");
+        token.textContent = tokenLabel(row.token);
+        token.title = "sha256: " + row.token_hash;
+        const count = document.createElement("b");
+        count.textContent = fmt(row.occurrences || 0);
+        el.appendChild(token);
+        el.appendChild(count);
+        target.appendChild(el);
+      }
+    }
+
+    function tokenLabel(token) {
+      if (token == null || token === "") return "(empty)";
+      return JSON.stringify(token);
     }
 
     document.querySelector("#refresh").onclick = refresh;

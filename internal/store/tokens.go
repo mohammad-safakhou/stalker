@@ -24,6 +24,7 @@ type tokenStats struct {
 }
 
 type tokenAggregate struct {
+	value         string
 	occurrences   int
 	firstPosition int
 }
@@ -116,6 +117,7 @@ func (s *tokenStats) addToken(value string, digest io.Writer) {
 		s.values[tokenHash] = agg
 	} else {
 		s.values[tokenHash] = tokenAggregate{
+			value:         value,
 			occurrences:   1,
 			firstPosition: s.tokenCount,
 		}
@@ -179,15 +181,15 @@ WHERE exchange_id = ? AND side = ? AND tokenizer = ?`,
 
 	stmt, err := tx.PrepareContext(ctx, `
 INSERT INTO llm_token_values (
-  exchange_id, side, tokenizer, token_hash, occurrences, first_position
-) VALUES (?, ?, ?, ?, ?, ?)`)
+  exchange_id, side, tokenizer, token_value, token_hash, occurrences, first_position
+) VALUES (?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
 	for tokenHash, agg := range stats.values {
-		if _, err := stmt.ExecContext(ctx, exchangeID, side, tokenizerVersion, tokenHash, agg.occurrences, agg.firstPosition); err != nil {
+		if _, err := stmt.ExecContext(ctx, exchangeID, side, tokenizerVersion, agg.value, tokenHash, agg.occurrences, agg.firstPosition); err != nil {
 			return err
 		}
 	}
@@ -234,7 +236,73 @@ GROUP BY side`)
 			totals.OutputTokens = count
 		}
 	}
-	return totals, rows.Err()
+	if err := rows.Err(); err != nil {
+		return TokenTotals{}, err
+	}
+	top, err := s.TopTokens(ctx, 12)
+	if err != nil {
+		return TokenTotals{}, err
+	}
+	totals.Top = top
+	return totals, nil
+}
+
+func (s *Store) TopTokens(ctx context.Context, limit int) (TokenBurns, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	input, err := s.topTokensForSide(ctx, "input", limit)
+	if err != nil {
+		return TokenBurns{}, err
+	}
+	output, err := s.topTokensForSide(ctx, "output", limit)
+	if err != nil {
+		return TokenBurns{}, err
+	}
+	return TokenBurns{Input: input, Output: output}, nil
+}
+
+func (s *Store) topTokensForSide(ctx context.Context, side string, limit int) ([]TokenBurn, error) {
+	queryLimit := limit * 20
+	if queryLimit < 100 {
+		queryLimit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT side, token_value, token_hash, SUM(occurrences) AS total_occurrences
+FROM llm_token_values
+WHERE side = ? AND tokenizer = ? AND token_value != ''
+GROUP BY side, token_value, token_hash
+ORDER BY total_occurrences DESC, token_value ASC
+LIMIT ?`, side, tokenizerVersion, queryLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TokenBurn
+	for rows.Next() {
+		var burn TokenBurn
+		if err := rows.Scan(&burn.Side, &burn.Token, &burn.TokenHash, &burn.Occurrences); err != nil {
+			return nil, err
+		}
+		if !isDisplayTokenValue(burn.Token) {
+			continue
+		}
+		out = append(out, burn)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, rows.Err()
+}
+
+func isDisplayTokenValue(token string) bool {
+	for _, rn := range token {
+		if unicode.IsLetter(rn) || unicode.IsDigit(rn) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) tokenRuns(ctx context.Context, exchangeID string) ([]TokenRun, error) {
@@ -262,7 +330,7 @@ ORDER BY side`, exchangeID)
 
 func (s *Store) tokenValues(ctx context.Context, exchangeID string, limit int) ([]TokenValue, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT exchange_id, side, tokenizer, token_hash, occurrences, first_position
+SELECT exchange_id, side, tokenizer, token_value, token_hash, occurrences, first_position
 FROM llm_token_values
 WHERE exchange_id = ?
 ORDER BY occurrences DESC, first_position ASC
@@ -279,6 +347,7 @@ LIMIT ?`, exchangeID, limit)
 			&value.ExchangeID,
 			&value.Side,
 			&value.Tokenizer,
+			&value.Token,
 			&value.TokenHash,
 			&value.Occurrences,
 			&value.FirstPosition,

@@ -131,7 +131,7 @@ func TestCaptureDecodesZstdPreviewAndBody(t *testing.T) {
 	}
 }
 
-func TestCaptureIndexesHashedInputOutputTokens(t *testing.T) {
+func TestCaptureIndexesInputOutputTokenBurns(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -198,12 +198,12 @@ func TestCaptureIndexesHashedInputOutputTokens(t *testing.T) {
 	for _, value := range report.Values {
 		if value.Side == "input" && value.TokenHash == alphaHash {
 			foundAlpha = true
+			if value.Token != "alpha" {
+				t.Fatalf("alpha token = %q, want alpha", value.Token)
+			}
 			if value.Occurrences != 2 {
 				t.Fatalf("alpha occurrences = %d, want 2", value.Occurrences)
 			}
-		}
-		if strings.Contains(value.TokenHash, "alpha") || strings.Contains(value.TokenHash, "gamma") {
-			t.Fatalf("token hash leaks raw text: %+v", value)
 		}
 	}
 	if !foundAlpha {
@@ -219,6 +219,15 @@ func TestCaptureIndexesHashedInputOutputTokens(t *testing.T) {
 	}
 	if totals.OutputTokens == 0 {
 		t.Fatalf("output total = %d, want non-zero", totals.OutputTokens)
+	}
+	if len(totals.Top.Input) == 0 {
+		t.Fatal("top input tokens is empty")
+	}
+	if totals.Top.Input[0].Token != "alpha" || totals.Top.Input[0].Occurrences != 2 {
+		t.Fatalf("top input token = %+v, want alpha with 2 occurrences", totals.Top.Input[0])
+	}
+	if len(totals.Top.Output) == 0 {
+		t.Fatal("top output tokens is empty")
 	}
 }
 
