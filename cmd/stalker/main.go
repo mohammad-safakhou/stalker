@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -24,6 +25,9 @@ func main() {
 			return
 		case "upgrade":
 			runUpgrade()
+			return
+		case "compact":
+			runCompact(os.Args[2:])
 			return
 		case "paths":
 			runPaths()
@@ -81,6 +85,29 @@ func runUpgrade() {
 	}
 }
 
+func runCompact(args []string) {
+	fs := flag.NewFlagSet("compact", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "confirm raw payload removal")
+	_ = fs.Parse(args)
+	if !*yes {
+		fmt.Fprintln(os.Stderr, "compact removes retained request/response payloads and per-exchange token rows. Re-run with --yes to confirm.")
+		os.Exit(2)
+	}
+	dataDir, err := config.DataDir()
+	if err != nil {
+		log.Fatal(err)
+	}
+	s, err := store.Open(dataDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.CompactRawData(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Compacted raw data in %s\n", dataDir)
+}
+
 func runPaths() {
 	dataDir, err := config.DataDir()
 	if err != nil {
@@ -100,6 +127,7 @@ func usage() {
   stalker serve           Run the proxy and dashboard
   stalker install         Set up data storage and optional service config
   stalker upgrade         Upgrade to the latest version with go install
+  stalker compact --yes   Remove retained raw payload data and shrink storage
   stalker paths           Print resolved data paths
 
 Install options:

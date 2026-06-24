@@ -52,9 +52,9 @@ OAuth JWT account claim.
 ## Storage
 
 Stalker stores request metadata in SQLite with WAL mode enabled and writes large
-request/response bodies under the data directory's `bodies/` folder. This keeps
-browsing and searching fast while allowing large streaming responses to be
-captured.
+request/response bytes through an in-memory token pipeline. Raw payloads are not
+retained by default. The database stores exchange metadata, per-exchange token
+runs, and global per-token aggregate counts.
 
 Environment variables:
 
@@ -94,4 +94,10 @@ Upgrade to the latest version with:
 
 ```bash
 stalker upgrade
+```
+
+Remove raw payload data retained by older versions and shrink the database with:
+
+```bash
+stalker compact --yes
 ```

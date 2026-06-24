@@ -61,15 +61,15 @@ func TestCapturePersistsExchange(t *testing.T) {
 	if item.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", item.StatusCode)
 	}
-	if !strings.Contains(item.RequestPreview, "ping") {
-		t.Fatalf("request preview = %q, want ping", item.RequestPreview)
+	if item.RequestPreview != "" || item.ResponsePreview != "" {
+		t.Fatalf("previews = (%q, %q), want no retained payload data", item.RequestPreview, item.ResponsePreview)
 	}
-	if !strings.Contains(item.ResponsePreview, "pong") {
-		t.Fatalf("response preview = %q, want pong", item.ResponsePreview)
+	if item.RequestBodyPath != "" || item.ResponseBodyPath != "" {
+		t.Fatalf("body paths = (%q, %q), want no retained body files", item.RequestBodyPath, item.ResponseBodyPath)
 	}
 }
 
-func TestCaptureDecodesZstdPreviewAndBody(t *testing.T) {
+func TestCaptureTokenizesZstdWithoutRetainingBody(t *testing.T) {
 	s, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -109,25 +109,15 @@ func TestCaptureDecodesZstdPreviewAndBody(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("items = %d, want 1", len(items))
 	}
-	if !strings.Contains(items[0].RequestPreview, "hello from compressed codex") {
-		t.Fatalf("request preview = %q, want decoded text", items[0].RequestPreview)
+	if items[0].RequestPreview != "" || items[0].RequestBodyPath != "" {
+		t.Fatalf("retained payload = (%q, %q), want empty", items[0].RequestPreview, items[0].RequestBodyPath)
 	}
-
-	info, err := s.Body(context.Background(), items[0].ID, "request")
+	report, err := s.TokenReport(context.Background(), items[0].ID, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := s.OpenBody(info)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer body.Close()
-	decoded, err := io.ReadAll(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(decoded), "hello from compressed codex") {
-		t.Fatalf("decoded body = %q, want decoded text", decoded)
+	if len(report.Runs) == 0 || report.Runs[0].TokenCount == 0 {
+		t.Fatalf("token report = %+v, want tokenized compressed input", report)
 	}
 }
 
@@ -193,21 +183,8 @@ func TestCaptureIndexesInputOutputTokenBurns(t *testing.T) {
 	if inputRun.TokenCount == 0 || inputRun.UniqueTokenCount == 0 || inputRun.DigestSHA256 == "" {
 		t.Fatalf("input token run not populated: %+v", inputRun)
 	}
-	alphaHash := hashToken("alpha")
-	var foundAlpha bool
-	for _, value := range report.Values {
-		if value.Side == "input" && value.TokenHash == alphaHash {
-			foundAlpha = true
-			if value.Token != "alpha" {
-				t.Fatalf("alpha token = %q, want alpha", value.Token)
-			}
-			if value.Occurrences != 2 {
-				t.Fatalf("alpha occurrences = %d, want 2", value.Occurrences)
-			}
-		}
-	}
-	if !foundAlpha {
-		t.Fatal("hashed alpha token was not indexed")
+	if len(report.Values) != 0 {
+		t.Fatalf("per-exchange token values = %d, want 0 for new captures", len(report.Values))
 	}
 
 	totals, err := s.TokenTotals(context.Background())
@@ -228,6 +205,61 @@ func TestCaptureIndexesInputOutputTokenBurns(t *testing.T) {
 	}
 	if len(totals.Top.Output) == 0 {
 		t.Fatal("top output tokens is empty")
+	}
+}
+
+func TestCompactRawDataRemovesBodiesAndPerExchangeTokenValues(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	capture, err := s.NewCapture(CaptureMeta{
+		Method:    "POST",
+		Path:      "/v1/responses",
+		Route:     "chatgpt-codex-responses",
+		TargetURL: "https://chatgpt.com/backend-api/codex/responses",
+		Headers:   http.Header{"Content-Type": []string{"application/json"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqBody := capture.RequestBody(io.NopCloser(strings.NewReader(`{"input":"alpha alpha beta"}`)))
+	if _, err := io.Copy(io.Discard, reqBody); err != nil {
+		t.Fatal(err)
+	}
+	if err := reqBody.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := capture.Save(""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.CompactRawData(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	items, err := s.List(context.Background(), ListFilter{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items[0].RequestPreview != "" || items[0].RequestBodyPath != "" {
+		t.Fatalf("payload data retained after compact: %+v", items[0])
+	}
+	report, err := s.TokenReport(context.Background(), items[0].ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Values) != 0 {
+		t.Fatalf("per-exchange token values = %d, want 0 after compact", len(report.Values))
+	}
+	totals, err := s.TokenTotals(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(totals.Top.Input) == 0 {
+		t.Fatal("top input tokens empty after compact")
 	}
 }
 

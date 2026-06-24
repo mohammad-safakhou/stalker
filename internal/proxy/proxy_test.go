@@ -244,11 +244,22 @@ func TestProxyRelaysAndCapturesWebSocketFrames(t *testing.T) {
 	if rows[0].StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("status = %d, want 101", rows[0].StatusCode)
 	}
-	if !strings.Contains(rows[0].RequestPreview, "ping") {
-		t.Fatalf("request preview = %q, want ping", rows[0].RequestPreview)
+	if rows[0].RequestPreview != "" || rows[0].ResponsePreview != "" {
+		t.Fatalf("previews = (%q, %q), want no retained payload data", rows[0].RequestPreview, rows[0].ResponsePreview)
 	}
-	if !strings.Contains(rows[0].ResponsePreview, "pong") {
-		t.Fatalf("response preview = %q, want pong", rows[0].ResponsePreview)
+	report, err := s.TokenReport(context.Background(), rows[0].ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Runs) != 2 {
+		t.Fatalf("token runs = %d, want request and response", len(report.Runs))
+	}
+	totals, err := s.TokenTotals(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals.InputTokens == 0 || totals.OutputTokens == 0 {
+		t.Fatalf("token totals = %+v, want non-zero input and output", totals)
 	}
 	_ = client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 	_ = client.Close()

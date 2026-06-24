@@ -2,15 +2,21 @@ package store
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"hash"
 	"io"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 const tokenizerVersion = "stalker-lex-v1"
@@ -29,45 +35,164 @@ type tokenAggregate struct {
 	firstPosition int
 }
 
-func (s *Store) ProcessExchangeTokens(ctx context.Context, ex Exchange, final bool) error {
-	sides := []struct {
-		name     string
-		path     string
-		headers  string
-		preview  string
-		rawBytes int64
-	}{
-		{name: "input", path: ex.RequestBodyPath, headers: ex.RequestHeaders, preview: ex.RequestPreview, rawBytes: ex.RequestBytes},
-		{name: "output", path: ex.ResponseBodyPath, headers: ex.ResponseHeaders, preview: ex.ResponsePreview, rawBytes: ex.ResponseBytes},
-	}
-
-	for _, side := range sides {
-		stats, err := tokenizeExchangeSide(side.path, side.headers, side.preview, final)
-		if err != nil {
-			return err
-		}
-		if !final && stats.byteCount == 0 && side.rawBytes > 0 {
-			stats.byteCount = side.rawBytes
-		}
-		if err := s.upsertTokenStats(ctx, ex.ID, side.name, stats); err != nil {
-			return err
-		}
-	}
-	return nil
+type tokenCollector struct {
+	encoding  string
+	raw       bytes.Buffer
+	stats     tokenStats
+	digest    hash.Hash
+	token     strings.Builder
+	pending   []byte
+	finalized bool
 }
 
-func tokenizeExchangeSide(path, headersJSON, preview string, final bool) (tokenStats, error) {
-	if final && path != "" {
-		body, err := openDecodedFile(path, contentEncodingFromJSON(headersJSON))
-		if err == nil {
-			defer body.Close()
-			return tokenizeReader(body)
-		}
-		if preview == "" && !errors.Is(err, io.EOF) {
+func newTokenCollector(encoding string) *tokenCollector {
+	return &tokenCollector{
+		encoding: normalizedEncoding(encoding),
+		stats:    tokenStats{values: map[string]tokenAggregate{}},
+		digest:   sha256.New(),
+	}
+}
+
+func (c *tokenCollector) SetEncoding(encoding string) {
+	c.encoding = normalizedEncoding(encoding)
+}
+
+func (c *tokenCollector) Write(chunk []byte) {
+	if len(chunk) == 0 || c.finalized {
+		return
+	}
+	if c.encoded() {
+		_, _ = c.raw.Write(chunk)
+		return
+	}
+	c.writePlain(chunk)
+}
+
+func (c *tokenCollector) Stats(final bool) (tokenStats, error) {
+	if final {
+		if err := c.finalize(); err != nil {
 			return tokenStats{}, err
 		}
 	}
-	return tokenizeReader(strings.NewReader(preview))
+	return cloneTokenStats(c.stats), nil
+}
+
+func (c *tokenCollector) finalize() error {
+	if c.finalized {
+		return nil
+	}
+	if c.encoded() {
+		stats, err := tokenizeEncodedBytes(c.raw.Bytes(), c.encoding)
+		c.raw.Reset()
+		if err != nil {
+			return err
+		}
+		c.stats = stats
+		c.finalized = true
+		return nil
+	}
+	if len(c.pending) > 0 {
+		for len(c.pending) > 0 {
+			rn, size := utf8.DecodeRune(c.pending)
+			if rn == utf8.RuneError && size == 1 {
+				rn = unicode.ReplacementChar
+			}
+			c.addRune(rn, size)
+			c.pending = c.pending[size:]
+		}
+	}
+	c.flushToken()
+	c.stats.digest = hex.EncodeToString(c.digest.Sum(nil))
+	c.finalized = true
+	return nil
+}
+
+func (c *tokenCollector) encoded() bool {
+	return c.encoding != "" && c.encoding != "identity"
+}
+
+func (c *tokenCollector) writePlain(chunk []byte) {
+	data := chunk
+	if len(c.pending) > 0 {
+		merged := make([]byte, 0, len(c.pending)+len(chunk))
+		merged = append(merged, c.pending...)
+		merged = append(merged, chunk...)
+		data = merged
+		c.pending = nil
+	}
+	for len(data) > 0 {
+		if !utf8.FullRune(data) {
+			c.pending = append(c.pending[:0], data...)
+			return
+		}
+		rn, size := utf8.DecodeRune(data)
+		c.addRune(rn, size)
+		data = data[size:]
+	}
+}
+
+func (c *tokenCollector) addRune(rn rune, size int) {
+	c.stats.charCount++
+	c.stats.byteCount += int64(size)
+	switch {
+	case isTokenRune(rn):
+		c.token.WriteRune(rn)
+	case unicode.IsSpace(rn):
+		c.flushToken()
+	default:
+		c.flushToken()
+		c.stats.addToken(string(rn), c.digest)
+	}
+}
+
+func (c *tokenCollector) flushToken() {
+	if c.token.Len() == 0 {
+		return
+	}
+	c.stats.addToken(c.token.String(), c.digest)
+	c.token.Reset()
+}
+
+func tokenizeEncodedBytes(raw []byte, encoding string) (tokenStats, error) {
+	r, err := decodedReader(bytes.NewReader(raw), encoding)
+	if err != nil {
+		return tokenStats{}, err
+	}
+	defer r.Close()
+	return tokenizeReader(r)
+}
+
+func decodedReader(r io.Reader, encoding string) (io.ReadCloser, error) {
+	switch normalizedEncoding(encoding) {
+	case "", "identity":
+		return io.NopCloser(r), nil
+	case "gzip":
+		return gzip.NewReader(r)
+	case "zstd":
+		decoder, err := zstd.NewReader(r)
+		if err != nil {
+			return nil, err
+		}
+		return &compoundReadCloser{
+			Reader:  decoder,
+			closers: []io.Closer{closerFunc(func() error { decoder.Close(); return nil })},
+		}, nil
+	default:
+		return io.NopCloser(r), nil
+	}
+}
+
+func normalizedEncoding(encoding string) string {
+	return strings.ToLower(strings.TrimSpace(encoding))
+}
+
+func cloneTokenStats(stats tokenStats) tokenStats {
+	out := stats
+	out.values = make(map[string]tokenAggregate, len(stats.values))
+	for key, value := range stats.values {
+		out.values[key] = value
+	}
+	return out
 }
 
 func tokenizeReader(r io.Reader) (tokenStats, error) {
@@ -136,7 +261,7 @@ func hashToken(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Store) upsertTokenStats(ctx context.Context, exchangeID, side string, stats tokenStats) error {
+func (s *Store) upsertTokenStats(ctx context.Context, exchangeID, side string, stats tokenStats, aggregate bool) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -169,38 +294,33 @@ ON CONFLICT(exchange_id, side, tokenizer) DO UPDATE SET
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-DELETE FROM llm_token_values
-WHERE exchange_id = ? AND side = ? AND tokenizer = ?`,
-		exchangeID,
-		side,
-		tokenizerVersion,
-	); err != nil {
-		return err
-	}
-
-	stmt, err := tx.PrepareContext(ctx, `
-INSERT INTO llm_token_values (
-  exchange_id, side, tokenizer, token_value, token_hash, occurrences, first_position
-) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	for tokenHash, agg := range stats.values {
-		if _, err := stmt.ExecContext(ctx, exchangeID, side, tokenizerVersion, agg.value, tokenHash, agg.occurrences, agg.firstPosition); err != nil {
+	if aggregate {
+		stmt, err := tx.PrepareContext(ctx, `
+INSERT INTO llm_token_totals (
+  side, tokenizer, token_value, token_hash, occurrences, first_seen_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(side, tokenizer, token_hash) DO UPDATE SET
+  token_value = CASE
+    WHEN llm_token_totals.token_value = '' THEN excluded.token_value
+    ELSE llm_token_totals.token_value
+  END,
+  occurrences = llm_token_totals.occurrences + excluded.occurrences,
+  updated_at = excluded.updated_at`)
+		if err != nil {
 			return err
+		}
+		defer stmt.Close()
+
+		for tokenHash, agg := range stats.values {
+			if _, err := stmt.ExecContext(ctx, side, tokenizerVersion, agg.value, tokenHash, agg.occurrences, now, now); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
 }
 
 func (s *Store) TokenReport(ctx context.Context, exchangeID string, limit int) (TokenReport, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 200
-	}
-
 	runs, err := s.tokenRuns(ctx, exchangeID)
 	if err != nil {
 		return TokenReport{}, err
@@ -268,11 +388,10 @@ func (s *Store) topTokensForSide(ctx context.Context, side string, limit int) ([
 		queryLimit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT side, token_value, token_hash, SUM(occurrences) AS total_occurrences
-FROM llm_token_values
+SELECT side, token_value, token_hash, occurrences
+FROM llm_token_totals
 WHERE side = ? AND tokenizer = ? AND token_value != ''
-GROUP BY side, token_value, token_hash
-ORDER BY total_occurrences DESC, token_value ASC
+ORDER BY occurrences DESC, token_value ASC
 LIMIT ?`, side, tokenizerVersion, queryLimit)
 	if err != nil {
 		return nil, err
@@ -329,12 +448,15 @@ ORDER BY side`, exchangeID)
 }
 
 func (s *Store) tokenValues(ctx context.Context, exchangeID string, limit int) ([]TokenValue, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT exchange_id, side, tokenizer, token_value, token_hash, occurrences, first_position
 FROM llm_token_values
 WHERE exchange_id = ?
 ORDER BY occurrences DESC, first_position ASC
-LIMIT ?`, exchangeID, limit)
+	LIMIT ?`, exchangeID, limit)
 	if err != nil {
 		return nil, err
 	}

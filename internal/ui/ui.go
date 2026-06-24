@@ -397,8 +397,8 @@ const indexHTML = `<!doctype html>
       detail.appendChild(stats);
 
       addMessages(row.request_preview, row.response_preview);
-      addBlock("Request", row.request_preview, "/api/exchanges/" + encodeURIComponent(id) + "/body/request");
-      addBlock("Response", row.response_preview, "/api/exchanges/" + encodeURIComponent(id) + "/body/response");
+      addBlock("Request", row.request_preview, row.request_body_path ? "/api/exchanges/" + encodeURIComponent(id) + "/body/request" : null);
+      addBlock("Response", row.response_preview, row.response_body_path ? "/api/exchanges/" + encodeURIComponent(id) + "/body/response" : null);
       addBlock("Request headers", pretty(row.request_headers), null);
       addBlock("Response headers", pretty(row.response_headers), null);
       if (row.error) addBlock("Error", row.error, null);

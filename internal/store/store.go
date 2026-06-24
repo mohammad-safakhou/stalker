@@ -1,8 +1,6 @@
 package store
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -16,16 +14,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
 	_ "modernc.org/sqlite"
 )
 
-const previewLimit = 64 * 1024
-
 type Store struct {
-	db      *sql.DB
-	dir     string
-	bodyDir string
+	db  *sql.DB
+	dir string
 }
 
 type Exchange struct {
@@ -108,17 +102,15 @@ type Capture struct {
 
 	ex Exchange
 
-	mu        sync.Mutex
-	reqFile   *os.File
-	respFile  *os.File
-	reqPrev   preview
-	respPrev  preview
-	reqBytes  int64
-	respBytes int64
-	reqEnc    string
-	respEnc   string
-	lastFlush time.Time
-	saved     bool
+	mu         sync.Mutex
+	reqTokens  *tokenCollector
+	respTokens *tokenCollector
+	reqBytes   int64
+	respBytes  int64
+	reqEnc     string
+	respEnc    string
+	lastFlush  time.Time
+	saved      bool
 }
 
 type CaptureMeta struct {
@@ -142,8 +134,7 @@ func Open(dir string) (*Store, error) {
 	if dir == "" {
 		dir = ".stalker"
 	}
-	bodyDir := filepath.Join(dir, "bodies")
-	if err := os.MkdirAll(bodyDir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 
@@ -153,7 +144,7 @@ func Open(dir string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{db: db, dir: dir, bodyDir: bodyDir}
+	s := &Store{db: db, dir: dir}
 	if err := s.init(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -233,11 +224,26 @@ CREATE TABLE IF NOT EXISTS llm_token_values (
   PRIMARY KEY (exchange_id, side, tokenizer, token_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_llm_token_values_hash ON llm_token_values(token_hash);
+
+CREATE TABLE IF NOT EXISTS llm_token_totals (
+  side TEXT NOT NULL,
+  tokenizer TEXT NOT NULL,
+  token_value TEXT NOT NULL DEFAULT '',
+  token_hash TEXT NOT NULL,
+  occurrences INTEGER NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (side, tokenizer, token_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_token_totals_occurrences ON llm_token_totals(side, tokenizer, occurrences DESC);
 `)
 	if err != nil {
 		return err
 	}
-	return s.ensureTokenValueColumns(ctx)
+	if err := s.ensureTokenValueColumns(ctx); err != nil {
+		return err
+	}
+	return s.backfillTokenTotals(ctx)
 }
 
 func (s *Store) ensureTokenValueColumns(ctx context.Context) error {
@@ -251,6 +257,32 @@ func (s *Store) ensureTokenValueColumns(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) backfillTokenTotals(ctx context.Context) error {
+	var totalRows int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM llm_token_totals`).Scan(&totalRows); err != nil {
+		return err
+	}
+	if totalRows > 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO llm_token_totals (
+  side, tokenizer, token_value, token_hash, occurrences, first_seen_at, updated_at
+)
+SELECT
+  side,
+  tokenizer,
+  MAX(token_value),
+  token_hash,
+  SUM(occurrences),
+  MIN(COALESCE((SELECT started_at FROM exchanges WHERE exchanges.id = llm_token_values.exchange_id), '')),
+  ?
+FROM llm_token_values
+WHERE token_value != ''
+GROUP BY side, tokenizer, token_hash`, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
 }
 
 func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
@@ -275,58 +307,85 @@ func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, erro
 	return false, rows.Err()
 }
 
+func (s *Store) CompactRawData(ctx context.Context) error {
+	if err := s.mergeTokenValuesIntoTotals(ctx); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `
+UPDATE exchanges
+SET request_body_path = '',
+    response_body_path = '',
+    request_preview = '',
+    response_preview = '';
+DELETE FROM llm_token_values;`); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(filepath.Join(s.dir, "bodies")); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
+}
+
+func (s *Store) mergeTokenValuesIntoTotals(ctx context.Context) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO llm_token_totals (
+  side, tokenizer, token_value, token_hash, occurrences, first_seen_at, updated_at
+)
+SELECT
+  side,
+  tokenizer,
+  MAX(token_value),
+  token_hash,
+  SUM(occurrences),
+  MIN(COALESCE((SELECT started_at FROM exchanges WHERE exchanges.id = llm_token_values.exchange_id), ?)),
+  ?
+FROM llm_token_values
+WHERE token_value != ''
+GROUP BY side, tokenizer, token_hash
+ON CONFLICT(side, tokenizer, token_hash) DO UPDATE SET
+  token_value = CASE
+    WHEN llm_token_totals.token_value = '' THEN excluded.token_value
+    ELSE llm_token_totals.token_value
+  END,
+  occurrences = llm_token_totals.occurrences + excluded.occurrences,
+  updated_at = excluded.updated_at`, now, now)
+	return err
+}
+
 func (s *Store) NewCapture(meta CaptureMeta) (*Capture, error) {
 	id := newID()
-	reqFile, reqPath, err := s.createBodyFile(id, "request")
-	if err != nil {
-		return nil, err
-	}
-	respFile, respPath, err := s.createBodyFile(id, "response")
-	if err != nil {
-		reqFile.Close()
-		return nil, err
-	}
+	reqEnc := contentEncoding(meta.Headers)
 
 	capture := &Capture{
-		store:     s,
-		reqFile:   reqFile,
-		respFile:  respFile,
-		reqEnc:    contentEncoding(meta.Headers),
-		lastFlush: time.Now().UTC(),
+		store:      s,
+		reqTokens:  newTokenCollector(reqEnc),
+		respTokens: newTokenCollector(""),
+		reqEnc:     reqEnc,
+		lastFlush:  time.Now().UTC(),
 		ex: Exchange{
-			ID:               id,
-			StartedAt:        time.Now().UTC(),
-			Method:           meta.Method,
-			Path:             meta.Path,
-			Query:            meta.Query,
-			Route:            meta.Route,
-			TargetURL:        meta.TargetURL,
-			ChatGPTAuth:      meta.ChatGPTAuth,
-			RequestHeaders:   marshalHeaders(meta.Headers),
-			RequestBodyPath:  reqPath,
-			ResponseBodyPath: respPath,
+			ID:             id,
+			StartedAt:      time.Now().UTC(),
+			Method:         meta.Method,
+			Path:           meta.Path,
+			Query:          meta.Query,
+			Route:          meta.Route,
+			TargetURL:      meta.TargetURL,
+			ChatGPTAuth:    meta.ChatGPTAuth,
+			RequestHeaders: marshalHeaders(meta.Headers),
 		},
 	}
 	if err := capture.Flush(""); err != nil {
-		_ = reqFile.Close()
-		_ = respFile.Close()
 		return nil, err
 	}
 	return capture, nil
-}
-
-func (s *Store) createBodyFile(id, kind string) (*os.File, string, error) {
-	date := time.Now().UTC().Format("2006-01-02")
-	dir := filepath.Join(s.bodyDir, date)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, "", err
-	}
-	path := filepath.Join(dir, id+"."+kind+".body")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
-	if err != nil {
-		return nil, "", err
-	}
-	return f, path, nil
 }
 
 func (c *Capture) RequestBody(body io.ReadCloser) io.ReadCloser {
@@ -339,9 +398,6 @@ func (c *Capture) RequestBody(body io.ReadCloser) io.ReadCloser {
 			c.WriteRequest(chunk)
 		},
 		close: func() {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			_ = c.reqFile.Close()
 		},
 	}
 }
@@ -359,9 +415,6 @@ func (c *Capture) ResponseBody(body io.ReadCloser, statusCode int, headers http.
 			c.WriteResponse(chunk)
 		},
 		close: func() {
-			c.mu.Lock()
-			_ = c.respFile.Close()
-			c.mu.Unlock()
 			_ = c.Save("")
 		},
 	}
@@ -377,8 +430,7 @@ func (c *Capture) WriteRequest(chunk []byte) {
 		return
 	}
 	c.reqBytes += int64(len(chunk))
-	c.reqPrev.Write(chunk)
-	_, _ = c.reqFile.Write(chunk)
+	c.reqTokens.Write(chunk)
 }
 
 func (c *Capture) WriteResponse(chunk []byte) {
@@ -391,8 +443,7 @@ func (c *Capture) WriteResponse(chunk []byte) {
 		return
 	}
 	c.respBytes += int64(len(chunk))
-	c.respPrev.Write(chunk)
-	_, _ = c.respFile.Write(chunk)
+	c.respTokens.Write(chunk)
 }
 
 func (c *Capture) ResponseMeta(statusCode int, headers http.Header, isStream bool) {
@@ -405,6 +456,7 @@ func (c *Capture) ResponseMeta(statusCode int, headers http.Header, isStream boo
 	c.ex.ResponseHeaders = marshalHeaders(headers)
 	c.ex.IsStream = isStream
 	c.respEnc = contentEncoding(headers)
+	c.respTokens.SetEncoding(c.respEnc)
 }
 
 func (c *Capture) Flush(errorMessage string) error {
@@ -421,7 +473,7 @@ func (c *Capture) Flush(errorMessage string) error {
 	if err := c.store.Insert(ctx, ex); err != nil {
 		return err
 	}
-	return c.store.ProcessExchangeTokens(ctx, ex, false)
+	return c.store.upsertCaptureTokens(ctx, ex.ID, c.reqTokens, c.respTokens, false)
 }
 
 func (c *Capture) Save(errorMessage string) error {
@@ -431,8 +483,6 @@ func (c *Capture) Save(errorMessage string) error {
 		return nil
 	}
 	c.saved = true
-	_ = c.reqFile.Close()
-	_ = c.respFile.Close()
 
 	c.lastFlush = time.Now().UTC()
 	ex := c.snapshotLocked(errorMessage, true)
@@ -442,7 +492,7 @@ func (c *Capture) Save(errorMessage string) error {
 	if err := c.store.Insert(ctx, ex); err != nil {
 		return err
 	}
-	return c.store.ProcessExchangeTokens(ctx, ex, true)
+	return c.store.upsertCaptureTokens(ctx, ex.ID, c.reqTokens, c.respTokens, true)
 }
 
 func (c *Capture) snapshotLocked(errorMessage string, final bool) Exchange {
@@ -451,13 +501,24 @@ func (c *Capture) snapshotLocked(errorMessage string, final bool) Exchange {
 	c.ex.Error = errorMessage
 	c.ex.RequestBytes = c.reqBytes
 	c.ex.ResponseBytes = c.respBytes
-	c.ex.RequestPreview = c.reqPrev.String()
-	c.ex.ResponsePreview = c.respPrev.String()
-	if final {
-		c.ex.RequestPreview = previewFromFile(c.ex.RequestBodyPath, c.reqEnc, c.ex.RequestPreview)
-		c.ex.ResponsePreview = previewFromFile(c.ex.ResponseBodyPath, c.respEnc, c.ex.ResponsePreview)
-	}
+	c.ex.RequestPreview = ""
+	c.ex.ResponsePreview = ""
 	return c.ex
+}
+
+func (s *Store) upsertCaptureTokens(ctx context.Context, exchangeID string, reqTokens, respTokens *tokenCollector, final bool) error {
+	reqStats, err := reqTokens.Stats(final)
+	if err != nil {
+		return err
+	}
+	if err := s.upsertTokenStats(ctx, exchangeID, "input", reqStats, final); err != nil {
+		return err
+	}
+	respStats, err := respTokens.Stats(final)
+	if err != nil {
+		return err
+	}
+	return s.upsertTokenStats(ctx, exchangeID, "output", respStats, final)
 }
 
 func (s *Store) Insert(ctx context.Context, ex Exchange) error {
@@ -585,7 +646,10 @@ func (s *Store) Body(ctx context.Context, id, side string) (BodyInfo, error) {
 }
 
 func (s *Store) OpenBody(info BodyInfo) (io.ReadCloser, error) {
-	return openDecodedFile(info.Path, info.Encoding)
+	if info.Preview != "" {
+		return io.NopCloser(strings.NewReader(info.Preview)), nil
+	}
+	return nil, fmt.Errorf("raw bodies are not retained")
 }
 
 type exchangeScanner interface {
@@ -626,8 +690,6 @@ func scanExchange(scanner exchangeScanner) (Exchange, error) {
 	ex.CompletedAt, _ = time.Parse(time.RFC3339Nano, completedAt)
 	ex.ChatGPTAuth = chatGPTAuth != 0
 	ex.IsStream = isStream != 0
-	ex.RequestPreview = decodedPreviewIfEncoded(ex.RequestBodyPath, ex.RequestHeaders, ex.RequestPreview)
-	ex.ResponsePreview = decodedPreviewIfEncoded(ex.ResponseBodyPath, ex.ResponseHeaders, ex.ResponsePreview)
 	return ex, nil
 }
 
@@ -672,63 +734,6 @@ func contentEncodingFromJSON(raw string) string {
 	return ""
 }
 
-func previewFromFile(path, encoding, fallback string) string {
-	r, err := openDecodedFile(path, encoding)
-	if err != nil {
-		if encoding != "" && fallback != "" {
-			return fmt.Sprintf("[body is %s encoded; preview decode failed: %v]\n%s", encoding, err, fallback)
-		}
-		return fallback
-	}
-	defer r.Close()
-
-	var buf bytes.Buffer
-	if _, err := io.CopyN(&buf, r, previewLimit); err != nil && !errors.Is(err, io.EOF) {
-		if fallback != "" {
-			return fallback
-		}
-	}
-	return buf.String()
-}
-
-func decodedPreviewIfEncoded(path, headersJSON, fallback string) string {
-	encoding := contentEncodingFromJSON(headersJSON)
-	if encoding == "" || encoding == "identity" {
-		return fallback
-	}
-	return previewFromFile(path, encoding, fallback)
-}
-
-func openDecodedFile(path, encoding string) (io.ReadCloser, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	switch strings.ToLower(strings.TrimSpace(encoding)) {
-	case "", "identity":
-		return f, nil
-	case "gzip":
-		gz, err := gzip.NewReader(f)
-		if err != nil {
-			f.Close()
-			return nil, err
-		}
-		return &compoundReadCloser{Reader: gz, closers: []io.Closer{gz, f}}, nil
-	case "zstd":
-		decoder, err := zstd.NewReader(f)
-		if err != nil {
-			f.Close()
-			return nil, err
-		}
-		return &compoundReadCloser{
-			Reader:  decoder,
-			closers: []io.Closer{closerFunc(func() error { decoder.Close(); return nil }), f},
-		}, nil
-	default:
-		return f, nil
-	}
-}
-
 func boolInt(v bool) int {
 	if v {
 		return 1
@@ -750,25 +755,6 @@ func randomSuffix() string {
 		}
 	}
 	return fmt.Sprintf("%08x", time.Now().Nanosecond())
-}
-
-type preview struct {
-	buf bytes.Buffer
-}
-
-func (p *preview) Write(chunk []byte) {
-	remaining := previewLimit - p.buf.Len()
-	if remaining <= 0 {
-		return
-	}
-	if len(chunk) > remaining {
-		chunk = chunk[:remaining]
-	}
-	p.buf.Write(chunk)
-}
-
-func (p *preview) String() string {
-	return p.buf.String()
 }
 
 type captureReadCloser struct {
