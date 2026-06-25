@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -73,5 +74,65 @@ func TestInstallRejectsUnknownService(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("Install() error = nil, want unknown service error")
+	}
+}
+
+func TestInstallRejectsUnknownRunner(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("LOCALAPPDATA", filepath.Join(tmp, "LocalAppData"))
+	t.Setenv("APPDATA", filepath.Join(tmp, "AppData"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmp, "xdg-data"))
+
+	var out bytes.Buffer
+	err := Install(InstallOptions{
+		In:      strings.NewReader(""),
+		Out:     &out,
+		Runner:  "systemd",
+		Service: ServiceNone,
+	})
+	if err == nil {
+		t.Fatal("Install() error = nil, want unknown runner error")
+	}
+}
+
+func TestInstallLaunchdRunnerWithoutStarting(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd is macOS-only")
+	}
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	var out bytes.Buffer
+	err := Install(InstallOptions{
+		In:            strings.NewReader(""),
+		Out:           &out,
+		Runner:        RunnerLaunchd,
+		Service:       ServiceNone,
+		NoStartRunner: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plistPath := filepath.Join(tmp, "Library", "LaunchAgents", "com.mohammad-safakhou.stalker.plist")
+	raw, err := os.ReadFile(plistPath)
+	if err != nil {
+		t.Fatalf("read launch agent: %v", err)
+	}
+	text := string(raw)
+	for _, want := range []string{
+		"<key>Label</key>",
+		"<string>com.mohammad-safakhou.stalker</string>",
+		"<string>serve</string>",
+		"<key>KeepAlive</key>",
+		"<key>RunAtLoad</key>",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("plist missing %q:\n%s", want, text)
+		}
+	}
+	if !strings.Contains(out.String(), "LaunchAgent start: skipped") {
+		t.Fatalf("install output did not mention skipped start:\n%s", out.String())
 	}
 }

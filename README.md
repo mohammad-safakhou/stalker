@@ -40,6 +40,42 @@ For local development without installing:
 make run
 ```
 
+## Background runner
+
+On macOS, install Stalker as a per-user LaunchAgent so it starts at login and
+stays running without a terminal:
+
+```bash
+stalker install --runner launchd --service codex
+```
+
+If you are currently using Codex through Stalker, do not run the command above
+from that same proxied session. Stop the terminal-run Stalker process first, or
+install the LaunchAgent without starting it:
+
+```bash
+stalker install --runner launchd --no-start-runner --service codex
+```
+
+Then start it from a normal terminal:
+
+```bash
+stalker runner start
+```
+
+Manage the runner with:
+
+```bash
+stalker runner status
+stalker runner restart
+stalker runner stop
+stalker runner uninstall
+```
+
+The LaunchAgent is written to
+`~/Library/LaunchAgents/com.mohammad-safakhou.stalker.plist`. Logs are written
+under `~/Library/Logs/stalker/`.
+
 Restarting Stalker interrupts any active client traffic routed through the
 proxy. If you are using Codex through Stalker, stop work or switch Codex away
 from the proxy before restarting the daemon.
@@ -109,8 +145,9 @@ Run setup after installing:
 stalker install
 ```
 
-The setup command creates the data directory and can optionally configure a
-service. For Codex, it writes this top-level setting to
+The setup command creates the data directory, can install the macOS background
+runner, and can optionally configure a service. For Codex, it writes this
+top-level setting to
 `~/.codex/config.toml`:
 
 ```toml
@@ -131,6 +168,12 @@ Upgrade to the latest version with:
 
 ```bash
 stalker upgrade
+```
+
+If Stalker is running through launchd, restart the runner after upgrading:
+
+```bash
+stalker upgrade --restart-runner
 ```
 
 Remove raw payload data retained by older versions and shrink the database with:

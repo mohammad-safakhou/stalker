@@ -17,6 +17,8 @@ import (
 
 const (
 	LegacyDir     = ".stalker"
+	RunnerLaunchd = "launchd"
+	RunnerNone    = "none"
 	ServiceCodex  = "codex"
 	ServiceNone   = "none"
 	proxyBaseURL  = "http://" + config.DefaultAddr + "/v1"
@@ -24,11 +26,13 @@ const (
 )
 
 type InstallOptions struct {
-	In      io.Reader
-	Out     io.Writer
-	Service string
-	Migrate bool
-	Yes     bool
+	In            io.Reader
+	Out           io.Writer
+	Runner        string
+	Service       string
+	Migrate       bool
+	NoStartRunner bool
+	Yes           bool
 }
 
 func Install(opts InstallOptions) error {
@@ -52,6 +56,39 @@ func Install(opts InstallOptions) error {
 
 	if err := migrateLegacyData(out, dataDir, opts.Migrate); err != nil {
 		return err
+	}
+
+	runner := opts.Runner
+	startRunner := false
+	if runner == "" && !opts.Yes {
+		var err error
+		runner, startRunner, err = promptRunner(in, out)
+		if err != nil {
+			return err
+		}
+	}
+	if runner == "" {
+		if opts.Yes && LaunchAgentSupported() {
+			runner = RunnerLaunchd
+			startRunner = true
+		} else {
+			runner = RunnerNone
+		}
+	} else if runner == RunnerLaunchd {
+		startRunner = true
+	}
+	if opts.NoStartRunner {
+		startRunner = false
+	}
+	switch runner {
+	case RunnerNone:
+		fmt.Fprintln(out, "Background runner: skipped")
+	case RunnerLaunchd:
+		if err := InstallLaunchAgent(out, startRunner); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown runner %q; use %q or %q", runner, RunnerLaunchd, RunnerNone)
 	}
 
 	service := opts.Service
@@ -84,7 +121,13 @@ func Install(opts InstallOptions) error {
 	return nil
 }
 
-func Upgrade(out io.Writer) error {
+type UpgradeOptions struct {
+	Out           io.Writer
+	RestartRunner bool
+}
+
+func Upgrade(opts UpgradeOptions) error {
+	out := opts.Out
 	if out == nil {
 		out = os.Stdout
 	}
@@ -96,7 +139,42 @@ func Upgrade(out io.Writer) error {
 		return fmt.Errorf("upgrade failed: %w", err)
 	}
 	fmt.Fprintln(out, "Upgrade complete")
+	if opts.RestartRunner {
+		if err := RestartLaunchAgent(out); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func promptRunner(in io.Reader, out io.Writer) (string, bool, error) {
+	if !LaunchAgentSupported() {
+		return RunnerNone, false, nil
+	}
+	fmt.Fprintf(out, "Install Stalker as a background runner? [%s/%s] (%s): ", RunnerLaunchd, RunnerNone, RunnerLaunchd)
+	scanner := bufio.NewScanner(in)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", false, err
+		}
+		return RunnerNone, false, nil
+	}
+	answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	if answer == "" {
+		answer = RunnerLaunchd
+	}
+	if answer != RunnerLaunchd {
+		return answer, false, nil
+	}
+	fmt.Fprintf(out, "Start the background runner now? [yes/no] (yes): ")
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", false, err
+		}
+		return RunnerLaunchd, true, nil
+	}
+	start := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	return RunnerLaunchd, start == "" || start == "y" || start == "yes", nil
 }
 
 func promptService(in io.Reader, out io.Writer) (string, error) {
