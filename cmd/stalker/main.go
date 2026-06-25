@@ -10,8 +10,10 @@ import (
 
 	"github.com/mohammad-safakhou/stalker/internal/app"
 	"github.com/mohammad-safakhou/stalker/internal/config"
+	"github.com/mohammad-safakhou/stalker/internal/discovery"
 	"github.com/mohammad-safakhou/stalker/internal/setup"
 	"github.com/mohammad-safakhou/stalker/internal/store"
+	"github.com/mohammad-safakhou/stalker/internal/syncapi"
 )
 
 func main() {
@@ -42,6 +44,7 @@ func main() {
 
 func runServer() {
 	addr := config.Addr()
+	syncAddr := config.SyncAddr()
 	dataDir, err := config.DataDir()
 	if err != nil {
 		log.Fatal(err)
@@ -56,6 +59,24 @@ func runServer() {
 	log.Printf("Stalker listening on http://%s", addr)
 	log.Printf("Dashboard: http://%s/ui/", addr)
 	log.Printf("Data dir: %s", dataDir)
+	if syncAddr != "" {
+		syncServer := &http.Server{Addr: syncAddr, Handler: syncapi.New(s)}
+		go func() {
+			log.Printf("Sync API listening on http://%s", syncAddr)
+			if err := syncServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("sync server error: %v", err)
+			}
+		}()
+		defer syncServer.Shutdown(context.Background())
+
+		advertiser, err := discovery.Advertise(syncAddr, s)
+		if err != nil {
+			log.Printf("Bonjour discovery disabled: %v", err)
+		} else if advertiser != nil {
+			defer advertiser.Shutdown()
+			log.Printf("Bonjour discovery: %s", discovery.ServiceType)
+		}
+	}
 	if err := http.ListenAndServe(addr, app.New(s)); err != nil {
 		log.Fatal(err)
 	}

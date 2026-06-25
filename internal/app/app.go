@@ -6,18 +6,21 @@ import (
 
 	"github.com/mohammad-safakhou/stalker/internal/proxy"
 	"github.com/mohammad-safakhou/stalker/internal/store"
+	"github.com/mohammad-safakhou/stalker/internal/syncapi"
 	"github.com/mohammad-safakhou/stalker/internal/ui"
 )
 
 type App struct {
-	proxy *proxy.Proxy
-	ui    *ui.Handler
+	proxy   *proxy.Proxy
+	syncapi *syncapi.Handler
+	ui      *ui.Handler
 }
 
 func New(s *store.Store) *App {
 	return &App{
-		proxy: &proxy.Proxy{Store: s},
-		ui:    ui.New(s),
+		proxy:   &proxy.Proxy{Store: s},
+		syncapi: syncapi.New(s),
+		ui:      ui.New(s),
 	}
 }
 
@@ -29,6 +32,8 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.URL.Path == "/api/exchanges" || strings.HasPrefix(r.URL.Path, "/api/exchanges/") ||
 		r.URL.Path == "/api/tokens/summary" || r.URL.Path == "/api/tokens/stream":
 		a.ui.ServeHTTP(w, r)
+	case r.URL.Path == "/api/v1/sync/snapshot" || r.URL.Path == "/api/v1/sync/stream":
+		a.syncapi.ServeHTTP(w, r)
 	default:
 		a.proxy.ServeHTTP(w, r)
 	}

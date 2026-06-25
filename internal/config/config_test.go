@@ -14,6 +14,22 @@ func TestAddrUsesEnvOverride(t *testing.T) {
 	}
 }
 
+func TestSyncAddrUsesEnvOverride(t *testing.T) {
+	t.Setenv("STALKER_SYNC_ADDR", "127.0.0.1:19091")
+
+	if got := SyncAddr(); got != "127.0.0.1:19091" {
+		t.Fatalf("SyncAddr() = %q, want env override", got)
+	}
+}
+
+func TestSyncAddrAllowsExplicitDisable(t *testing.T) {
+	t.Setenv("STALKER_SYNC_ADDR", "")
+
+	if got := SyncAddr(); got != "" {
+		t.Fatalf("SyncAddr() = %q, want disabled sync listener", got)
+	}
+}
+
 func TestDataDirUsesEnvOverride(t *testing.T) {
 	t.Setenv("STALKER_DATA_DIR", "/tmp/stalker-test")
 

@@ -65,3 +65,23 @@ func TestAppRoutesTokenStreamToUI(t *testing.T) {
 	<-done
 	t.Fatalf("stream body = %q, want data event", rec.Body.String())
 }
+
+func TestAppRoutesSyncSnapshotToSyncAPI(t *testing.T) {
+	s, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:18080/api/v1/sync/snapshot", nil)
+	rec := httptest.NewRecorder()
+
+	New(s).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"device"`) {
+		t.Fatalf("body = %q, want sync snapshot", rec.Body.String())
+	}
+}

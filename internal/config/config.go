@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	AppName     = "stalker"
-	DefaultAddr = "127.0.0.1:18080"
+	AppName         = "stalker"
+	DefaultAddr     = "127.0.0.1:18080"
+	DefaultSyncAddr = "0.0.0.0:18081"
 )
 
 func Addr() string {
@@ -17,6 +18,13 @@ func Addr() string {
 		return addr
 	}
 	return DefaultAddr
+}
+
+func SyncAddr() string {
+	if addr, ok := os.LookupEnv("STALKER_SYNC_ADDR"); ok {
+		return addr
+	}
+	return DefaultSyncAddr
 }
 
 func DataDir() (string, error) {
