@@ -1,35 +1,45 @@
 package store
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"errors"
-	"hash"
+	"encoding/json"
+	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
+	tiktoken "github.com/pkoukk/tiktoken-go"
 )
 
-const tokenizerVersion = "stalker-lex-v1"
+const (
+	countSourceLocalTiktoken = "tiktoken_local"
+	defaultEncodingName      = tiktoken.MODEL_O200K_BASE
+)
 
 type tokenStats struct {
-	tokenCount int
-	byteCount  int64
-	charCount  int64
-	digest     string
-	values     map[string]tokenAggregate
+	tokenizer       string
+	countSource     string
+	tokenCount      int
+	byteCount       int64
+	charCount       int64
+	wordCount       int
+	uniqueWordCount int
+	digest          string
+	values          map[string]textAggregate
+	words           map[string]textAggregate
+	chars           map[string]textAggregate
 }
 
-type tokenAggregate struct {
+type textAggregate struct {
 	value         string
 	occurrences   int
 	firstPosition int
@@ -38,19 +48,18 @@ type tokenAggregate struct {
 type tokenCollector struct {
 	encoding  string
 	raw       bytes.Buffer
-	stats     tokenStats
-	digest    hash.Hash
-	token     strings.Builder
-	pending   []byte
 	finalized bool
+	side      string
+}
+
+type tokenPayload struct {
+	side     string
+	encoding string
+	raw      []byte
 }
 
 func newTokenCollector(encoding string) *tokenCollector {
-	return &tokenCollector{
-		encoding: normalizedEncoding(encoding),
-		stats:    tokenStats{values: map[string]tokenAggregate{}},
-		digest:   sha256.New(),
-	}
+	return &tokenCollector{encoding: normalizedEncoding(encoding)}
 }
 
 func (c *tokenCollector) SetEncoding(encoding string) {
@@ -61,105 +70,71 @@ func (c *tokenCollector) Write(chunk []byte) {
 	if len(chunk) == 0 || c.finalized {
 		return
 	}
-	if c.encoded() {
-		_, _ = c.raw.Write(chunk)
-		return
-	}
-	c.writePlain(chunk)
+	_, _ = c.raw.Write(chunk)
 }
 
-func (c *tokenCollector) Stats(final bool) (tokenStats, error) {
-	if final {
-		if err := c.finalize(); err != nil {
-			return tokenStats{}, err
-		}
-	}
-	return cloneTokenStats(c.stats), nil
-}
-
-func (c *tokenCollector) finalize() error {
-	if c.finalized {
-		return nil
-	}
-	if c.encoded() {
-		stats, err := tokenizeEncodedBytes(c.raw.Bytes(), c.encoding)
-		c.raw.Reset()
-		if err != nil {
-			return err
-		}
-		c.stats = stats
-		c.finalized = true
-		return nil
-	}
-	if len(c.pending) > 0 {
-		for len(c.pending) > 0 {
-			rn, size := utf8.DecodeRune(c.pending)
-			if rn == utf8.RuneError && size == 1 {
-				rn = unicode.ReplacementChar
-			}
-			c.addRune(rn, size)
-			c.pending = c.pending[size:]
-		}
-	}
-	c.flushToken()
-	c.stats.digest = hex.EncodeToString(c.digest.Sum(nil))
+func (c *tokenCollector) Payload() tokenPayload {
 	c.finalized = true
-	return nil
+	return tokenPayload{
+		side:     c.side,
+		encoding: c.encoding,
+		raw:      append([]byte(nil), c.raw.Bytes()...),
+	}
+}
+
+func (c *tokenCollector) Model() string {
+	return c.Payload().Model()
+}
+
+func (c *tokenCollector) Stats(final bool, model string) (tokenStats, error) {
+	if final {
+		c.finalized = true
+	}
+	return c.Payload().Stats(model)
+}
+
+func (p tokenPayload) Model() string {
+	raw, err := p.decodedBytes()
+	if err != nil {
+		return ""
+	}
+	return extractModel(raw)
+}
+
+func (p tokenPayload) Stats(model string) (tokenStats, error) {
+	raw, err := p.decodedBytes()
+	if err != nil {
+		return tokenStats{}, err
+	}
+	text := extractCountingText(p.side, raw)
+	return calculateLocalStats(text, model)
+}
+
+func (c *tokenCollector) decodedBytes() ([]byte, error) {
+	return c.Payload().decodedBytes()
+}
+
+func (p tokenPayload) decodedBytes() ([]byte, error) {
+	if len(p.raw) == 0 {
+		return nil, nil
+	}
+	if !p.encoded() {
+		return append([]byte(nil), p.raw...), nil
+	}
+	r, err := decodedReader(bytes.NewReader(p.raw), p.encoding)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return io.ReadAll(r)
 }
 
 func (c *tokenCollector) encoded() bool {
 	return c.encoding != "" && c.encoding != "identity"
 }
 
-func (c *tokenCollector) writePlain(chunk []byte) {
-	data := chunk
-	if len(c.pending) > 0 {
-		merged := make([]byte, 0, len(c.pending)+len(chunk))
-		merged = append(merged, c.pending...)
-		merged = append(merged, chunk...)
-		data = merged
-		c.pending = nil
-	}
-	for len(data) > 0 {
-		if !utf8.FullRune(data) {
-			c.pending = append(c.pending[:0], data...)
-			return
-		}
-		rn, size := utf8.DecodeRune(data)
-		c.addRune(rn, size)
-		data = data[size:]
-	}
-}
-
-func (c *tokenCollector) addRune(rn rune, size int) {
-	c.stats.charCount++
-	c.stats.byteCount += int64(size)
-	switch {
-	case isTokenRune(rn):
-		c.token.WriteRune(rn)
-	case unicode.IsSpace(rn):
-		c.flushToken()
-	default:
-		c.flushToken()
-		c.stats.addToken(string(rn), c.digest)
-	}
-}
-
-func (c *tokenCollector) flushToken() {
-	if c.token.Len() == 0 {
-		return
-	}
-	c.stats.addToken(c.token.String(), c.digest)
-	c.token.Reset()
-}
-
-func tokenizeEncodedBytes(raw []byte, encoding string) (tokenStats, error) {
-	r, err := decodedReader(bytes.NewReader(raw), encoding)
-	if err != nil {
-		return tokenStats{}, err
-	}
-	defer r.Close()
-	return tokenizeReader(r)
+func (p tokenPayload) encoded() bool {
+	return p.encoding != "" && p.encoding != "identity"
 }
 
 func decodedReader(r io.Reader, encoding string) (io.ReadCloser, error) {
@@ -186,82 +161,219 @@ func normalizedEncoding(encoding string) string {
 	return strings.ToLower(strings.TrimSpace(encoding))
 }
 
-func cloneTokenStats(stats tokenStats) tokenStats {
-	out := stats
-	out.values = make(map[string]tokenAggregate, len(stats.values))
-	for key, value := range stats.values {
-		out.values[key] = value
+func calculateLocalStats(text, model string) (tokenStats, error) {
+	encodingName := encodingNameForModel(model)
+	enc, err := tiktoken.GetEncoding(encodingName)
+	if err != nil {
+		return tokenStats{}, err
 	}
-	return out
-}
 
-func tokenizeReader(r io.Reader) (tokenStats, error) {
-	stats := tokenStats{values: map[string]tokenAggregate{}}
+	stats := tokenStats{
+		tokenizer:   "tiktoken:" + encodingName,
+		countSource: countSourceLocalTiktoken,
+		byteCount:   int64(len([]byte(text))),
+		charCount:   int64(utf8.RuneCountInString(text)),
+		values:      map[string]textAggregate{},
+		words:       map[string]textAggregate{},
+		chars:       map[string]textAggregate{},
+	}
 	digest := sha256.New()
-	reader := bufio.NewReader(r)
-	var token strings.Builder
 
-	flush := func() {
-		if token.Len() == 0 {
-			return
+	ids := enc.EncodeOrdinary(text)
+	for i, id := range ids {
+		value := enc.Decode([]int{id})
+		stats.addAggregate(stats.values, value, i)
+		_, _ = digest.Write([]byte(value))
+		_, _ = digest.Write([]byte{0})
+	}
+	stats.tokenCount = len(ids)
+
+	for _, word := range extractWords(text) {
+		stats.addAggregate(stats.words, word, stats.wordCount)
+		stats.wordCount++
+	}
+	stats.uniqueWordCount = len(stats.words)
+
+	charPos := 0
+	for _, rn := range text {
+		if unicode.IsSpace(rn) || unicode.IsControl(rn) {
+			continue
 		}
-		stats.addToken(token.String(), digest)
-		token.Reset()
+		stats.addAggregate(stats.chars, string(rn), charPos)
+		charPos++
 	}
 
-	for {
-		rn, size, err := reader.ReadRune()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return tokenStats{}, err
-		}
-		stats.charCount++
-		stats.byteCount += int64(size)
-
-		switch {
-		case isTokenRune(rn):
-			token.WriteRune(rn)
-		case unicode.IsSpace(rn):
-			flush()
-		default:
-			flush()
-			stats.addToken(string(rn), digest)
-		}
-	}
-	flush()
 	stats.digest = hex.EncodeToString(digest.Sum(nil))
 	return stats, nil
 }
 
-func (s *tokenStats) addToken(value string, digest io.Writer) {
-	tokenHash := hashToken(value)
-	if agg, ok := s.values[tokenHash]; ok {
+func (s *tokenStats) addAggregate(values map[string]textAggregate, value string, position int) {
+	hash := hashValue(value)
+	if agg, ok := values[hash]; ok {
 		agg.occurrences++
-		s.values[tokenHash] = agg
-	} else {
-		s.values[tokenHash] = tokenAggregate{
-			value:         value,
-			occurrences:   1,
-			firstPosition: s.tokenCount,
+		values[hash] = agg
+		return
+	}
+	values[hash] = textAggregate{
+		value:         value,
+		occurrences:   1,
+		firstPosition: position,
+	}
+}
+
+func extractWords(text string) []string {
+	var words []string
+	var current strings.Builder
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		words = append(words, strings.ToLower(current.String()))
+		current.Reset()
+	}
+	for _, rn := range text {
+		switch {
+		case unicode.IsLetter(rn) || unicode.IsDigit(rn) || rn == '_' || rn == '-' || rn == '\'':
+			current.WriteRune(unicode.ToLower(rn))
+		default:
+			flush()
 		}
 	}
-	_, _ = digest.Write([]byte(value))
-	_, _ = digest.Write([]byte{0})
-	s.tokenCount++
+	flush()
+	return words
 }
 
-func isTokenRune(rn rune) bool {
-	return unicode.IsLetter(rn) || unicode.IsDigit(rn) || rn == '_' || rn == '-' || rn == '\''
+func extractModel(raw []byte) string {
+	var root any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&root); err != nil {
+		return ""
+	}
+	if obj, ok := root.(map[string]any); ok {
+		if model, ok := obj["model"].(string); ok {
+			return strings.TrimSpace(model)
+		}
+	}
+	return ""
 }
 
-func hashToken(value string) string {
+func extractCountingText(side string, raw []byte) string {
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return ""
+	}
+
+	var root any
+	decoder := json.NewDecoder(strings.NewReader(text))
+	decoder.UseNumber()
+	if err := decoder.Decode(&root); err == nil {
+		var parts []string
+		collectText(root, "", side, &parts)
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+
+	if strings.Contains(text, "\ndata:") || strings.HasPrefix(text, "data:") {
+		var parts []string
+		for _, line := range strings.Split(text, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if payload == "" || payload == "[DONE]" {
+				continue
+			}
+			var event any
+			decoder := json.NewDecoder(strings.NewReader(payload))
+			decoder.UseNumber()
+			if err := decoder.Decode(&event); err == nil {
+				collectText(event, "", side, &parts)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+
+	return text
+}
+
+func collectText(value any, key, side string, parts *[]string) {
+	switch v := value.(type) {
+	case string:
+		if shouldCountString(key, side) {
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				*parts = append(*parts, trimmed)
+			}
+		}
+	case []any:
+		for _, item := range v {
+			collectText(item, key, side, parts)
+		}
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			lower := strings.ToLower(k)
+			if lower == "model" || lower == "id" || lower == "created" || lower == "object" || lower == "status" {
+				continue
+			}
+			collectText(v[k], lower, side, parts)
+		}
+	}
+}
+
+func shouldCountString(key, side string) bool {
+	switch strings.ToLower(key) {
+	case "", "input", "instructions", "messages", "message", "content", "text", "output", "delta",
+		"arguments", "description", "name", "tool", "tools", "function", "prompt", "refusal":
+		return true
+	case "role", "type", "finish_reason":
+		return false
+	default:
+		return side == "output" && (strings.Contains(key, "text") || strings.Contains(key, "content"))
+	}
+}
+
+func encodingNameForModel(model string) string {
+	model = strings.TrimSpace(model)
+	if model != "" {
+		if name, ok := tiktoken.MODEL_TO_ENCODING[model]; ok {
+			return name
+		}
+		for prefix, name := range tiktoken.MODEL_PREFIX_TO_ENCODING {
+			if strings.HasPrefix(model, prefix) {
+				return name
+			}
+		}
+		lower := strings.ToLower(model)
+		switch {
+		case strings.HasPrefix(lower, "gpt-5"),
+			strings.HasPrefix(lower, "gpt-4.5"),
+			strings.HasPrefix(lower, "gpt-4.1"),
+			strings.HasPrefix(lower, "gpt-4o"),
+			strings.HasPrefix(lower, "o1"),
+			strings.HasPrefix(lower, "o3"),
+			strings.HasPrefix(lower, "o4"),
+			strings.Contains(lower, "codex"):
+			return tiktoken.MODEL_O200K_BASE
+		}
+	}
+	return defaultEncodingName
+}
+
+func hashValue(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Store) upsertTokenStats(ctx context.Context, exchangeID, side string, stats tokenStats, aggregate bool) error {
+func (s *Store) upsertTokenStats(ctx context.Context, exchangeID, side, provider, model string, stats tokenStats, aggregate bool) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -270,22 +382,42 @@ func (s *Store) upsertTokenStats(ctx context.Context, exchangeID, side string, s
 	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `
+DELETE FROM llm_token_runs
+WHERE exchange_id = ? AND side = ?
+  AND (provider != ? OR model != ? OR tokenizer != ? OR count_source != ?)`,
+		exchangeID, side, provider, model, stats.tokenizer, stats.countSource,
+	); err != nil {
+		return err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO llm_token_runs (
-  exchange_id, side, tokenizer, token_count, unique_token_count,
+  exchange_id, side, provider, model, tokenizer, count_source,
+  token_count, unique_token_count, word_count, unique_word_count,
   byte_count, char_count, digest_sha256, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(exchange_id, side, tokenizer) DO UPDATE SET
+  provider = excluded.provider,
+  model = excluded.model,
+  count_source = excluded.count_source,
   token_count = excluded.token_count,
   unique_token_count = excluded.unique_token_count,
+  word_count = excluded.word_count,
+  unique_word_count = excluded.unique_word_count,
   byte_count = excluded.byte_count,
   char_count = excluded.char_count,
   digest_sha256 = excluded.digest_sha256,
   updated_at = excluded.updated_at`,
 		exchangeID,
 		side,
-		tokenizerVersion,
+		provider,
+		model,
+		stats.tokenizer,
+		stats.countSource,
 		stats.tokenCount,
 		len(stats.values),
+		stats.wordCount,
+		stats.uniqueWordCount,
 		stats.byteCount,
 		stats.charCount,
 		stats.digest,
@@ -295,29 +427,83 @@ ON CONFLICT(exchange_id, side, tokenizer) DO UPDATE SET
 	}
 
 	if aggregate {
-		stmt, err := tx.PrepareContext(ctx, `
+		if err := upsertTextTotals(ctx, tx, "llm_token_totals", "token", side, provider, model, stats.tokenizer, stats.values, now); err != nil {
+			return err
+		}
+		if err := upsertTextTotals(ctx, tx, "llm_word_totals", "word", side, provider, model, "", stats.words, now); err != nil {
+			return err
+		}
+		if err := upsertTextTotals(ctx, tx, "llm_char_totals", "char", side, provider, model, "", stats.chars, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func upsertTextTotals(ctx context.Context, tx *sql.Tx, table, prefix, side, provider, model, tokenizer string, values map[string]textAggregate, now string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	var stmt *sql.Stmt
+	var err error
+	switch table {
+	case "llm_token_totals":
+		stmt, err = tx.PrepareContext(ctx, `
 INSERT INTO llm_token_totals (
-  side, tokenizer, token_value, token_hash, occurrences, first_seen_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(side, tokenizer, token_hash) DO UPDATE SET
+  side, provider, model, tokenizer, token_value, token_hash, occurrences, first_seen_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(side, provider, model, tokenizer, token_hash) DO UPDATE SET
   token_value = CASE
     WHEN llm_token_totals.token_value = '' THEN excluded.token_value
     ELSE llm_token_totals.token_value
   END,
   occurrences = llm_token_totals.occurrences + excluded.occurrences,
   updated_at = excluded.updated_at`)
-		if err != nil {
-			return err
-		}
-		defer stmt.Close()
+	case "llm_word_totals":
+		stmt, err = tx.PrepareContext(ctx, `
+INSERT INTO llm_word_totals (
+  side, provider, model, word_value, word_hash, occurrences, first_seen_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(side, provider, model, word_hash) DO UPDATE SET
+  word_value = CASE
+    WHEN llm_word_totals.word_value = '' THEN excluded.word_value
+    ELSE llm_word_totals.word_value
+  END,
+  occurrences = llm_word_totals.occurrences + excluded.occurrences,
+  updated_at = excluded.updated_at`)
+	case "llm_char_totals":
+		stmt, err = tx.PrepareContext(ctx, `
+INSERT INTO llm_char_totals (
+  side, provider, model, char_value, char_hash, occurrences, first_seen_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(side, provider, model, char_hash) DO UPDATE SET
+  char_value = CASE
+    WHEN llm_char_totals.char_value = '' THEN excluded.char_value
+    ELSE llm_char_totals.char_value
+  END,
+  occurrences = llm_char_totals.occurrences + excluded.occurrences,
+  updated_at = excluded.updated_at`)
+	default:
+		return fmt.Errorf("unknown aggregate table %q", table)
+	}
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
 
-		for tokenHash, agg := range stats.values {
-			if _, err := stmt.ExecContext(ctx, side, tokenizerVersion, agg.value, tokenHash, agg.occurrences, now, now); err != nil {
+	for valueHash, agg := range values {
+		if table == "llm_token_totals" {
+			if _, err := stmt.ExecContext(ctx, side, provider, model, tokenizer, agg.value, valueHash, agg.occurrences, now, now); err != nil {
 				return err
 			}
+			continue
+		}
+		if _, err := stmt.ExecContext(ctx, side, provider, model, agg.value, valueHash, agg.occurrences, now, now); err != nil {
+			return err
 		}
 	}
-	return tx.Commit()
+	_ = prefix
+	return nil
 }
 
 func (s *Store) TokenReport(ctx context.Context, exchangeID string, limit int) (TokenReport, error) {
@@ -334,7 +520,10 @@ func (s *Store) TokenReport(ctx context.Context, exchangeID string, limit int) (
 
 func (s *Store) TokenTotals(ctx context.Context) (TokenTotals, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT side, COALESCE(SUM(token_count), 0)
+SELECT side,
+  COALESCE(SUM(token_count), 0),
+  COALESCE(SUM(char_count), 0),
+  COALESCE(SUM(word_count), 0)
 FROM llm_token_runs
 GROUP BY side`)
 	if err != nil {
@@ -345,15 +534,19 @@ GROUP BY side`)
 	var totals TokenTotals
 	for rows.Next() {
 		var side string
-		var count int64
-		if err := rows.Scan(&side, &count); err != nil {
+		var tokens, chars, words int64
+		if err := rows.Scan(&side, &tokens, &chars, &words); err != nil {
 			return TokenTotals{}, err
 		}
 		switch side {
 		case "input":
-			totals.InputTokens = count
+			totals.InputTokens = tokens
+			totals.InputChars = chars
+			totals.InputWords = words
 		case "output":
-			totals.OutputTokens = count
+			totals.OutputTokens = tokens
+			totals.OutputChars = chars
+			totals.OutputWords = words
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -364,6 +557,16 @@ GROUP BY side`)
 		return TokenTotals{}, err
 	}
 	totals.Top = top
+	topWords, err := s.TopText(ctx, "word", 12)
+	if err != nil {
+		return TokenTotals{}, err
+	}
+	totals.TopWords = topWords
+	topChars, err := s.TopText(ctx, "char", 12)
+	if err != nil {
+		return TokenTotals{}, err
+	}
+	totals.TopChars = topChars
 	return totals, nil
 }
 
@@ -388,11 +591,11 @@ func (s *Store) topTokensForSide(ctx context.Context, side string, limit int) ([
 		queryLimit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT side, token_value, token_hash, occurrences
+SELECT side, provider, model, token_value, token_hash, occurrences
 FROM llm_token_totals
-WHERE side = ? AND tokenizer = ? AND token_value != ''
+WHERE side = ? AND token_value != ''
 ORDER BY occurrences DESC, token_value ASC
-LIMIT ?`, side, tokenizerVersion, queryLimit)
+LIMIT ?`, side, queryLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -401,7 +604,7 @@ LIMIT ?`, side, tokenizerVersion, queryLimit)
 	var out []TokenBurn
 	for rows.Next() {
 		var burn TokenBurn
-		if err := rows.Scan(&burn.Side, &burn.Token, &burn.TokenHash, &burn.Occurrences); err != nil {
+		if err := rows.Scan(&burn.Side, &burn.Provider, &burn.Model, &burn.Token, &burn.TokenHash, &burn.Occurrences); err != nil {
 			return nil, err
 		}
 		if !isDisplayTokenValue(burn.Token) {
@@ -411,6 +614,59 @@ LIMIT ?`, side, tokenizerVersion, queryLimit)
 		if len(out) >= limit {
 			break
 		}
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) TopText(ctx context.Context, kind string, limit int) (TextBurns, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	input, err := s.topTextForSide(ctx, kind, "input", limit)
+	if err != nil {
+		return TextBurns{}, err
+	}
+	output, err := s.topTextForSide(ctx, kind, "output", limit)
+	if err != nil {
+		return TextBurns{}, err
+	}
+	return TextBurns{Input: input, Output: output}, nil
+}
+
+func (s *Store) topTextForSide(ctx context.Context, kind, side string, limit int) ([]TextBurn, error) {
+	table := ""
+	valueColumn := ""
+	hashColumn := ""
+	switch kind {
+	case "word":
+		table = "llm_word_totals"
+		valueColumn = "word_value"
+		hashColumn = "word_hash"
+	case "char":
+		table = "llm_char_totals"
+		valueColumn = "char_value"
+		hashColumn = "char_hash"
+	default:
+		return nil, fmt.Errorf("unknown text aggregate kind %q", kind)
+	}
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+SELECT side, provider, model, %s, %s, occurrences
+FROM %s
+WHERE side = ? AND %s != ''
+ORDER BY occurrences DESC, %s ASC
+LIMIT ?`, valueColumn, hashColumn, table, valueColumn, valueColumn), side, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TextBurn
+	for rows.Next() {
+		var burn TextBurn
+		if err := rows.Scan(&burn.Side, &burn.Provider, &burn.Model, &burn.Value, &burn.ValueHash, &burn.Occurrences); err != nil {
+			return nil, err
+		}
+		out = append(out, burn)
 	}
 	return out, rows.Err()
 }
@@ -426,7 +682,8 @@ func isDisplayTokenValue(token string) bool {
 
 func (s *Store) tokenRuns(ctx context.Context, exchangeID string) ([]TokenRun, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT exchange_id, side, tokenizer, token_count, unique_token_count,
+SELECT exchange_id, side, provider, model, tokenizer, count_source,
+  token_count, unique_token_count, word_count, unique_word_count,
   byte_count, char_count, digest_sha256, updated_at
 FROM llm_token_runs
 WHERE exchange_id = ?
@@ -456,7 +713,7 @@ SELECT exchange_id, side, tokenizer, token_value, token_hash, occurrences, first
 FROM llm_token_values
 WHERE exchange_id = ?
 ORDER BY occurrences DESC, first_position ASC
-	LIMIT ?`, exchangeID, limit)
+LIMIT ?`, exchangeID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -487,9 +744,14 @@ func scanTokenRun(row *sql.Rows) (TokenRun, error) {
 	err := row.Scan(
 		&run.ExchangeID,
 		&run.Side,
+		&run.Provider,
+		&run.Model,
 		&run.Tokenizer,
+		&run.CountSource,
 		&run.TokenCount,
 		&run.UniqueTokenCount,
+		&run.WordCount,
+		&run.UniqueWordCount,
 		&run.ByteCount,
 		&run.CharCount,
 		&run.DigestSHA256,

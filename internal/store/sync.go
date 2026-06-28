@@ -22,6 +22,14 @@ type SyncSnapshot struct {
 	Daily     []StatsBucket `json:"daily"`
 }
 
+type SyncHealth struct {
+	Device           SyncDevice `json:"device"`
+	Generated        time.Time  `json:"generated_at"`
+	Status           string     `json:"status"`
+	PendingTokenJobs int        `json:"pending_token_jobs"`
+	TokenQueueSize   int        `json:"token_queue_size"`
+}
+
 type SyncDevice struct {
 	ID       string    `json:"id"`
 	Name     string    `json:"name"`
@@ -30,11 +38,16 @@ type SyncDevice struct {
 }
 
 type LiveStats struct {
-	WindowSeconds int   `json:"window_seconds"`
-	InputTokens   int64 `json:"input_tokens"`
-	OutputTokens  int64 `json:"output_tokens"`
-	Requests      int64 `json:"requests"`
-	Errors        int64 `json:"errors"`
+	WindowSeconds       int     `json:"window_seconds"`
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	InputChars          int64   `json:"input_chars"`
+	OutputChars         int64   `json:"output_chars"`
+	Requests            int64   `json:"requests"`
+	Errors              int64   `json:"errors"`
+	TokensPerSecond     float64 `json:"tokens_per_second"`
+	CharactersPerSecond float64 `json:"characters_per_second"`
+	RequestsPerMinute   float64 `json:"requests_per_minute"`
 }
 
 type StatsBucket struct {
@@ -43,6 +56,8 @@ type StatsBucket struct {
 	Start        time.Time `json:"start"`
 	InputTokens  int64     `json:"input_tokens"`
 	OutputTokens int64     `json:"output_tokens"`
+	InputChars   int64     `json:"input_chars"`
+	OutputChars  int64     `json:"output_chars"`
 	Requests     int64     `json:"requests"`
 	Errors       int64     `json:"errors"`
 	Streams      int64     `json:"streams"`
@@ -101,6 +116,29 @@ func (s *Store) SyncDevice() (SyncDevice, error) {
 	}, nil
 }
 
+func (s *Store) SyncHealth(ctx context.Context) (SyncHealth, error) {
+	device, err := s.SyncDevice()
+	if err != nil {
+		return SyncHealth{}, err
+	}
+	if err := s.db.PingContext(ctx); err != nil {
+		return SyncHealth{}, err
+	}
+	queueSize := 0
+	pending := 0
+	if s.tokenJobs != nil {
+		queueSize = cap(s.tokenJobs)
+		pending = len(s.tokenJobs)
+	}
+	return SyncHealth{
+		Device:           device,
+		Generated:        time.Now().UTC(),
+		Status:           "ok",
+		PendingTokenJobs: pending,
+		TokenQueueSize:   queueSize,
+	}, nil
+}
+
 func (s *Store) deviceID() (string, error) {
 	path := filepath.Join(s.dir, "device_id")
 	raw, err := os.ReadFile(path)
@@ -146,6 +184,8 @@ func (s *Store) LiveStats(ctx context.Context, since time.Time) (LiveStats, erro
 SELECT
   COALESCE(SUM(CASE WHEN llm_token_runs.side = 'input' THEN llm_token_runs.token_count ELSE 0 END), 0),
   COALESCE(SUM(CASE WHEN llm_token_runs.side = 'output' THEN llm_token_runs.token_count ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN llm_token_runs.side = 'input' THEN llm_token_runs.char_count ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN llm_token_runs.side = 'output' THEN llm_token_runs.char_count ELSE 0 END), 0),
   COUNT(DISTINCT exchanges.id),
   COUNT(DISTINCT CASE WHEN exchanges.error != '' OR exchanges.status_code >= 400 THEN exchanges.id END)
 FROM exchanges
@@ -153,10 +193,19 @@ LEFT JOIN llm_token_runs ON llm_token_runs.exchange_id = exchanges.id
 WHERE exchanges.started_at >= ?`, since.UTC().Format(time.RFC3339Nano)).Scan(
 		&stats.InputTokens,
 		&stats.OutputTokens,
+		&stats.InputChars,
+		&stats.OutputChars,
 		&stats.Requests,
 		&stats.Errors,
 	)
-	return stats, err
+	if err != nil {
+		return stats, err
+	}
+	window := float64(stats.WindowSeconds)
+	stats.TokensPerSecond = float64(stats.InputTokens+stats.OutputTokens) / window
+	stats.CharactersPerSecond = float64(stats.InputChars+stats.OutputChars) / window
+	stats.RequestsPerMinute = float64(stats.Requests) / window * 60
+	return stats, nil
 }
 
 func (s *Store) StatsBuckets(ctx context.Context, deviceID, granularity string, limit int) ([]StatsBucket, error) {
@@ -177,6 +226,8 @@ func (s *Store) StatsBuckets(ctx context.Context, deviceID, granularity string, 
 SELECT bucket_start,
   COALESCE(SUM(input_tokens), 0),
   COALESCE(SUM(output_tokens), 0),
+  COALESCE(SUM(input_chars), 0),
+  COALESCE(SUM(output_chars), 0),
   COUNT(*),
   COALESCE(SUM(error_count), 0),
   COALESCE(SUM(stream_count), 0)
@@ -186,6 +237,8 @@ FROM (
     exchanges.id AS exchange_id,
     MAX(CASE WHEN llm_token_runs.side = 'input' THEN llm_token_runs.token_count ELSE 0 END) AS input_tokens,
     MAX(CASE WHEN llm_token_runs.side = 'output' THEN llm_token_runs.token_count ELSE 0 END) AS output_tokens,
+    MAX(CASE WHEN llm_token_runs.side = 'input' THEN llm_token_runs.char_count ELSE 0 END) AS input_chars,
+    MAX(CASE WHEN llm_token_runs.side = 'output' THEN llm_token_runs.char_count ELSE 0 END) AS output_chars,
     CASE WHEN exchanges.error != '' OR exchanges.status_code >= 400 THEN 1 ELSE 0 END AS error_count,
     CASE WHEN exchanges.is_stream != 0 THEN 1 ELSE 0 END AS stream_count
   FROM exchanges
@@ -208,6 +261,8 @@ LIMIT ?`, limit)
 			&start,
 			&bucket.InputTokens,
 			&bucket.OutputTokens,
+			&bucket.InputChars,
+			&bucket.OutputChars,
 			&bucket.Requests,
 			&bucket.Errors,
 			&bucket.Streams,

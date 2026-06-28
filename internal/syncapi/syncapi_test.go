@@ -56,6 +56,32 @@ func TestSnapshotReturnsAggregateOnlyPayload(t *testing.T) {
 	}
 }
 
+func TestHealthReturnsCheapConnectionPayload(t *testing.T) {
+	s, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:18080/api/v1/sync/health", nil)
+	rec := httptest.NewRecorder()
+
+	New(s).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"status": "ok"`) {
+		t.Fatalf("body = %s, want ok health status", body)
+	}
+	for _, forbidden := range []string{"request_headers", "response_headers", "request_preview", "response_preview"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("health leaked %q in body: %s", forbidden, body)
+		}
+	}
+}
+
 func TestStreamReturnsSnapshotEvent(t *testing.T) {
 	s := testStoreWithCapture(t)
 	defer s.Close()
@@ -126,5 +152,22 @@ func testStoreWithCapture(t *testing.T) *store.Store {
 	if err := respBody.Close(); err != nil {
 		t.Fatal(err)
 	}
+	waitForTotals(t, s)
 	return s
+}
+
+func waitForTotals(t *testing.T, s *store.Store) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		totals, err := s.TokenTotals(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if totals.InputTokens > 0 && totals.OutputTokens > 0 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("token totals did not populate")
 }

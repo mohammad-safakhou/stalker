@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -112,10 +113,7 @@ func TestCaptureTokenizesZstdWithoutRetainingBody(t *testing.T) {
 	if items[0].RequestPreview != "" || items[0].RequestBodyPath != "" {
 		t.Fatalf("retained payload = (%q, %q), want empty", items[0].RequestPreview, items[0].RequestBodyPath)
 	}
-	report, err := s.TokenReport(context.Background(), items[0].ID, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
+	report := waitForTokenRuns(t, s, items[0].ID, 1)
 	if len(report.Runs) == 0 || report.Runs[0].TokenCount == 0 {
 		t.Fatalf("token report = %+v, want tokenized compressed input", report)
 	}
@@ -164,10 +162,7 @@ func TestCaptureIndexesInputOutputTokenBurns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := s.TokenReport(context.Background(), items[0].ID, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
+	report := waitForTokenRuns(t, s, items[0].ID, 2)
 	if len(report.Runs) != 2 {
 		t.Fatalf("token runs = %d, want input and output", len(report.Runs))
 	}
@@ -177,10 +172,16 @@ func TestCaptureIndexesInputOutputTokenBurns(t *testing.T) {
 			inputRun = run
 		}
 	}
-	if inputRun.Tokenizer != tokenizerVersion {
-		t.Fatalf("input tokenizer = %q, want %q", inputRun.Tokenizer, tokenizerVersion)
+	if inputRun.Provider != "chatgpt" {
+		t.Fatalf("input provider = %q, want chatgpt", inputRun.Provider)
 	}
-	if inputRun.TokenCount == 0 || inputRun.UniqueTokenCount == 0 || inputRun.DigestSHA256 == "" {
+	if !strings.HasPrefix(inputRun.Tokenizer, "tiktoken:") {
+		t.Fatalf("input tokenizer = %q, want tiktoken", inputRun.Tokenizer)
+	}
+	if inputRun.CountSource != countSourceLocalTiktoken {
+		t.Fatalf("input count source = %q, want %q", inputRun.CountSource, countSourceLocalTiktoken)
+	}
+	if inputRun.TokenCount == 0 || inputRun.UniqueTokenCount == 0 || inputRun.WordCount == 0 || inputRun.DigestSHA256 == "" {
 		t.Fatalf("input token run not populated: %+v", inputRun)
 	}
 	if len(report.Values) != 0 {
@@ -197,11 +198,11 @@ func TestCaptureIndexesInputOutputTokenBurns(t *testing.T) {
 	if totals.OutputTokens == 0 {
 		t.Fatalf("output total = %d, want non-zero", totals.OutputTokens)
 	}
-	if len(totals.Top.Input) == 0 {
-		t.Fatal("top input tokens is empty")
+	if len(totals.TopWords.Input) == 0 {
+		t.Fatal("top input words is empty")
 	}
-	if totals.Top.Input[0].Token != "alpha" || totals.Top.Input[0].Occurrences != 2 {
-		t.Fatalf("top input token = %+v, want alpha with 2 occurrences", totals.Top.Input[0])
+	if totals.TopWords.Input[0].Value != "alpha" || totals.TopWords.Input[0].Occurrences != 2 {
+		t.Fatalf("top input word = %+v, want alpha with 2 occurrences", totals.TopWords.Input[0])
 	}
 	if len(totals.Top.Output) == 0 {
 		t.Fatal("top output tokens is empty")
@@ -236,6 +237,7 @@ func TestCompactRawDataRemovesBodiesAndPerExchangeTokenValues(t *testing.T) {
 	if err := capture.Save(""); err != nil {
 		t.Fatal(err)
 	}
+	waitForTokenRuns(t, s, capture.ex.ID, 1)
 
 	if err := s.CompactRawData(context.Background()); err != nil {
 		t.Fatal(err)
@@ -277,4 +279,23 @@ func zstdBytes(t *testing.T, raw string) []byte {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+func waitForTokenRuns(t *testing.T, s *Store, exchangeID string, want int) TokenReport {
+	t.Helper()
+	var report TokenReport
+	var err error
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		report, err = s.TokenReport(context.Background(), exchangeID, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(report.Runs) >= want {
+			return report
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("token runs = %d, want at least %d", len(report.Runs), want)
+	return report
 }

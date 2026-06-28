@@ -4,13 +4,20 @@ public struct StalkerAPIClient: Sendable {
     public var baseURL: URL
     public var session: URLSession
 
-    public init(baseURL: URL = URL(string: "http://127.0.0.1:18080")!, session: URLSession = .shared) {
+    public init(baseURL: URL = URL(string: "http://127.0.0.1:18081")!, session: URLSession = StalkerAPIClient.defaultSession()) {
         self.baseURL = baseURL
         self.session = session
     }
 
     public init(discovered service: DiscoveredStalker, session: URLSession = .shared) {
         self.init(baseURL: service.baseURL, session: session)
+    }
+
+    public func health() async throws -> SyncHealth {
+        let url = baseURL.appending(path: "/api/v1/sync/health")
+        let (data, response) = try await session.data(from: url)
+        try validate(response)
+        return try StalkerCoders.decoder().decode(SyncHealth.self, from: data)
     }
 
     public func snapshot() async throws -> SyncSnapshot {
@@ -41,6 +48,14 @@ public struct StalkerAPIClient: Sendable {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    public static func defaultSession() -> URLSession {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 8
+        configuration.timeoutIntervalForResource = 15
+        configuration.waitsForConnectivity = false
+        return URLSession(configuration: configuration)
     }
 
     private func validate(_ response: URLResponse) throws {

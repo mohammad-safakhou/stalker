@@ -2,3 +2,7 @@
 .stalker/
 bin/
 apple/StalkerApple/.build/
+apple/StalkerApple/.swiftpm/xcode/
+**/xcuserdata/
+**/UserInterfaceState.xcuserstate
+**/IDEFindNavigatorScopes.plist

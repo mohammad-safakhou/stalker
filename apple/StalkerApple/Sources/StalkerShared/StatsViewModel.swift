@@ -7,10 +7,10 @@ public final class StatsViewModel: ObservableObject {
     @Published public private(set) var isLive = false
     @Published public private(set) var errorMessage: String?
 
-    private var client: StalkerAPIClient
+    private var client: StalkerAPIClient?
     private var liveTask: Task<Void, Never>?
 
-    public init(client: StalkerAPIClient = StalkerAPIClient()) {
+    public init(client: StalkerAPIClient? = StalkerAPIClient()) {
         self.client = client
     }
 
@@ -19,6 +19,10 @@ public final class StatsViewModel: ObservableObject {
     }
 
     public func refresh() async {
+        guard let client else {
+            errorMessage = "Waiting for Stalker on your local network"
+            return
+        }
         do {
             snapshot = try await client.snapshot()
             errorMessage = nil
@@ -31,7 +35,16 @@ public final class StatsViewModel: ObservableObject {
         self.client = client
     }
 
+    public func showStatus(_ message: String) {
+        errorMessage = message
+    }
+
     public func connectLive() {
+        guard let client else {
+            isLive = false
+            errorMessage = "Waiting for Stalker on your local network"
+            return
+        }
         liveTask?.cancel()
         liveTask = Task {
             do {

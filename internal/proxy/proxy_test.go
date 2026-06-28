@@ -226,6 +226,9 @@ func TestProxyRelaysAndCapturesWebSocketFrames(t *testing.T) {
 		t.Fatalf("client payload = %q, want pong", payload)
 	}
 
+	_ = client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+	_ = client.Close()
+
 	var rows []store.Exchange
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -247,9 +250,17 @@ func TestProxyRelaysAndCapturesWebSocketFrames(t *testing.T) {
 	if rows[0].RequestPreview != "" || rows[0].ResponsePreview != "" {
 		t.Fatalf("previews = (%q, %q), want no retained payload data", rows[0].RequestPreview, rows[0].ResponsePreview)
 	}
-	report, err := s.TokenReport(context.Background(), rows[0].ID, 100)
-	if err != nil {
-		t.Fatal(err)
+	var report store.TokenReport
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		report, err = s.TokenReport(context.Background(), rows[0].ID, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(report.Runs) == 2 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 	if len(report.Runs) != 2 {
 		t.Fatalf("token runs = %d, want request and response", len(report.Runs))
@@ -261,8 +272,6 @@ func TestProxyRelaysAndCapturesWebSocketFrames(t *testing.T) {
 	if totals.InputTokens == 0 || totals.OutputTokens == 0 {
 		t.Fatalf("token totals = %+v, want non-zero input and output", totals)
 	}
-	_ = client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
-	_ = client.Close()
 }
 
 func newRequest(t *testing.T, method, target string) *http.Request {

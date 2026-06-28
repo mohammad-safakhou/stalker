@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,8 +19,13 @@ import (
 )
 
 type Store struct {
-	db  *sql.DB
-	dir string
+	db        *sql.DB
+	dir       string
+	tokenJobs chan tokenJob
+	tokenWG   sync.WaitGroup
+	tokenMu   sync.Mutex
+	closed    bool
+	closeOnce sync.Once
 }
 
 type Exchange struct {
@@ -27,6 +33,8 @@ type Exchange struct {
 	StartedAt        time.Time `json:"started_at"`
 	CompletedAt      time.Time `json:"completed_at"`
 	DurationMS       int64     `json:"duration_ms"`
+	Provider         string    `json:"provider"`
+	Model            string    `json:"model"`
 	Method           string    `json:"method"`
 	Path             string    `json:"path"`
 	Query            string    `json:"query"`
@@ -49,9 +57,14 @@ type Exchange struct {
 type TokenRun struct {
 	ExchangeID       string    `json:"exchange_id"`
 	Side             string    `json:"side"`
+	Provider         string    `json:"provider"`
+	Model            string    `json:"model"`
 	Tokenizer        string    `json:"tokenizer"`
+	CountSource      string    `json:"count_source"`
 	TokenCount       int       `json:"token_count"`
 	UniqueTokenCount int       `json:"unique_token_count"`
+	WordCount        int       `json:"word_count"`
+	UniqueWordCount  int       `json:"unique_word_count"`
 	ByteCount        int64     `json:"byte_count"`
 	CharCount        int64     `json:"char_count"`
 	DigestSHA256     string    `json:"digest_sha256"`
@@ -70,6 +83,8 @@ type TokenValue struct {
 
 type TokenBurn struct {
 	Side        string `json:"side"`
+	Provider    string `json:"provider"`
+	Model       string `json:"model"`
 	Token       string `json:"token"`
 	TokenHash   string `json:"token_hash"`
 	Occurrences int64  `json:"occurrences"`
@@ -80,6 +95,20 @@ type TokenBurns struct {
 	Output []TokenBurn `json:"output"`
 }
 
+type TextBurn struct {
+	Side        string `json:"side"`
+	Provider    string `json:"provider"`
+	Model       string `json:"model"`
+	Value       string `json:"value"`
+	ValueHash   string `json:"value_hash"`
+	Occurrences int64  `json:"occurrences"`
+}
+
+type TextBurns struct {
+	Input  []TextBurn `json:"input"`
+	Output []TextBurn `json:"output"`
+}
+
 type TokenReport struct {
 	Runs   []TokenRun   `json:"runs"`
 	Values []TokenValue `json:"values"`
@@ -88,7 +117,13 @@ type TokenReport struct {
 type TokenTotals struct {
 	InputTokens  int64      `json:"input_tokens"`
 	OutputTokens int64      `json:"output_tokens"`
+	InputChars   int64      `json:"input_chars"`
+	OutputChars  int64      `json:"output_chars"`
+	InputWords   int64      `json:"input_words"`
+	OutputWords  int64      `json:"output_words"`
 	Top          TokenBurns `json:"top"`
+	TopWords     TextBurns  `json:"top_words"`
+	TopChars     TextBurns  `json:"top_chars"`
 }
 
 type ListFilter struct {
@@ -144,16 +179,28 @@ func Open(dir string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{db: db, dir: dir}
+	s := &Store{db: db, dir: dir, tokenJobs: make(chan tokenJob, 1024)}
 	if err := s.init(context.Background()); err != nil {
 		db.Close()
 		return nil, err
 	}
+	s.startTokenWorker()
 	return s, nil
 }
 
 func (s *Store) Close() error {
-	return s.db.Close()
+	var err error
+	s.closeOnce.Do(func() {
+		if s.tokenJobs != nil {
+			s.tokenMu.Lock()
+			s.closed = true
+			close(s.tokenJobs)
+			s.tokenMu.Unlock()
+			s.tokenWG.Wait()
+		}
+		err = s.db.Close()
+	})
+	return err
 }
 
 func (s *Store) init(ctx context.Context) error {
@@ -176,6 +223,8 @@ CREATE TABLE IF NOT EXISTS exchanges (
   started_at TEXT NOT NULL,
   completed_at TEXT NOT NULL,
   duration_ms INTEGER NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
   method TEXT NOT NULL,
   path TEXT NOT NULL,
   query TEXT NOT NULL,
@@ -201,9 +250,14 @@ CREATE INDEX IF NOT EXISTS idx_exchanges_status_code ON exchanges(status_code);
 CREATE TABLE IF NOT EXISTS llm_token_runs (
   exchange_id TEXT NOT NULL,
   side TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
   tokenizer TEXT NOT NULL,
+  count_source TEXT NOT NULL DEFAULT '',
   token_count INTEGER NOT NULL,
   unique_token_count INTEGER NOT NULL,
+  word_count INTEGER NOT NULL DEFAULT 0,
+  unique_word_count INTEGER NOT NULL DEFAULT 0,
   byte_count INTEGER NOT NULL,
   char_count INTEGER NOT NULL,
   digest_sha256 TEXT NOT NULL,
@@ -216,6 +270,8 @@ CREATE INDEX IF NOT EXISTS idx_llm_token_runs_side ON llm_token_runs(side);
 CREATE TABLE IF NOT EXISTS llm_token_values (
   exchange_id TEXT NOT NULL,
   side TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
   tokenizer TEXT NOT NULL,
   token_value TEXT NOT NULL DEFAULT '',
   token_hash TEXT NOT NULL,
@@ -227,20 +283,54 @@ CREATE INDEX IF NOT EXISTS idx_llm_token_values_hash ON llm_token_values(token_h
 
 CREATE TABLE IF NOT EXISTS llm_token_totals (
   side TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
   tokenizer TEXT NOT NULL,
   token_value TEXT NOT NULL DEFAULT '',
   token_hash TEXT NOT NULL,
   occurrences INTEGER NOT NULL,
   first_seen_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  PRIMARY KEY (side, tokenizer, token_hash)
+  PRIMARY KEY (side, provider, model, tokenizer, token_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_llm_token_totals_occurrences ON llm_token_totals(side, tokenizer, occurrences DESC);
+
+CREATE TABLE IF NOT EXISTS llm_word_totals (
+  side TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  word_value TEXT NOT NULL DEFAULT '',
+  word_hash TEXT NOT NULL,
+  occurrences INTEGER NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (side, provider, model, word_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_word_totals_occurrences ON llm_word_totals(side, occurrences DESC);
+
+CREATE TABLE IF NOT EXISTS llm_char_totals (
+  side TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  char_value TEXT NOT NULL DEFAULT '',
+  char_hash TEXT NOT NULL,
+  occurrences INTEGER NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (side, provider, model, char_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_char_totals_occurrences ON llm_char_totals(side, occurrences DESC);
 `)
 	if err != nil {
 		return err
 	}
 	if err := s.ensureTokenValueColumns(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureAnalyticsColumns(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureTokenTotalsDimensions(ctx); err != nil {
 		return err
 	}
 	return s.backfillTokenTotals(ctx)
@@ -259,6 +349,96 @@ func (s *Store) ensureTokenValueColumns(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) ensureAnalyticsColumns(ctx context.Context) error {
+	tables := map[string][]string{
+		"exchanges": {
+			"provider TEXT NOT NULL DEFAULT ''",
+			"model TEXT NOT NULL DEFAULT ''",
+		},
+		"llm_token_runs": {
+			"provider TEXT NOT NULL DEFAULT ''",
+			"model TEXT NOT NULL DEFAULT ''",
+			"count_source TEXT NOT NULL DEFAULT ''",
+			"word_count INTEGER NOT NULL DEFAULT 0",
+			"unique_word_count INTEGER NOT NULL DEFAULT 0",
+		},
+		"llm_token_values": {
+			"provider TEXT NOT NULL DEFAULT ''",
+			"model TEXT NOT NULL DEFAULT ''",
+		},
+	}
+	for table, columns := range tables {
+		for _, definition := range columns {
+			column := strings.Fields(definition)[0]
+			has, err := s.hasColumn(ctx, table, column)
+			if err != nil {
+				return err
+			}
+			if !has {
+				if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+definition); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureTokenTotalsDimensions(ctx context.Context) error {
+	hasProvider, err := s.hasColumn(ctx, "llm_token_totals", "provider")
+	if err != nil {
+		return err
+	}
+	hasModel, err := s.hasColumn(ctx, "llm_token_totals", "model")
+	if err != nil {
+		return err
+	}
+	if hasProvider && hasModel {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE llm_token_totals RENAME TO llm_token_totals_old`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE llm_token_totals (
+  side TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  tokenizer TEXT NOT NULL,
+  token_value TEXT NOT NULL DEFAULT '',
+  token_hash TEXT NOT NULL,
+  occurrences INTEGER NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (side, provider, model, tokenizer, token_hash)
+)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO llm_token_totals (
+  side, provider, model, tokenizer, token_value, token_hash, occurrences, first_seen_at, updated_at
+)
+SELECT side, '', '', tokenizer, MAX(token_value), token_hash, SUM(occurrences), MIN(first_seen_at), MAX(updated_at)
+FROM llm_token_totals_old
+GROUP BY side, tokenizer, token_hash`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE llm_token_totals_old`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_llm_token_totals_occurrences ON llm_token_totals(side, tokenizer, occurrences DESC)`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) backfillTokenTotals(ctx context.Context) error {
 	var totalRows int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM llm_token_totals`).Scan(&totalRows); err != nil {
@@ -269,10 +449,12 @@ func (s *Store) backfillTokenTotals(ctx context.Context) error {
 	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO llm_token_totals (
-  side, tokenizer, token_value, token_hash, occurrences, first_seen_at, updated_at
+  side, provider, model, tokenizer, token_value, token_hash, occurrences, first_seen_at, updated_at
 )
 SELECT
   side,
+  provider,
+  model,
   tokenizer,
   MAX(token_value),
   token_hash,
@@ -281,7 +463,7 @@ SELECT
   ?
 FROM llm_token_values
 WHERE token_value != ''
-GROUP BY side, tokenizer, token_hash`, time.Now().UTC().Format(time.RFC3339Nano))
+GROUP BY side, provider, model, tokenizer, token_hash`, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 
@@ -337,10 +519,12 @@ func (s *Store) mergeTokenValuesIntoTotals(ctx context.Context) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO llm_token_totals (
-  side, tokenizer, token_value, token_hash, occurrences, first_seen_at, updated_at
+  side, provider, model, tokenizer, token_value, token_hash, occurrences, first_seen_at, updated_at
 )
 SELECT
   side,
+  provider,
+  model,
   tokenizer,
   MAX(token_value),
   token_hash,
@@ -349,8 +533,8 @@ SELECT
   ?
 FROM llm_token_values
 WHERE token_value != ''
-GROUP BY side, tokenizer, token_hash
-ON CONFLICT(side, tokenizer, token_hash) DO UPDATE SET
+GROUP BY side, provider, model, tokenizer, token_hash
+ON CONFLICT(side, provider, model, tokenizer, token_hash) DO UPDATE SET
   token_value = CASE
     WHEN llm_token_totals.token_value = '' THEN excluded.token_value
     ELSE llm_token_totals.token_value
@@ -373,6 +557,7 @@ func (s *Store) NewCapture(meta CaptureMeta) (*Capture, error) {
 		ex: Exchange{
 			ID:             id,
 			StartedAt:      time.Now().UTC(),
+			Provider:       providerFromRoute(meta.Route, meta.TargetURL),
 			Method:         meta.Method,
 			Path:           meta.Path,
 			Query:          meta.Query,
@@ -382,9 +567,8 @@ func (s *Store) NewCapture(meta CaptureMeta) (*Capture, error) {
 			RequestHeaders: marshalHeaders(meta.Headers),
 		},
 	}
-	if err := capture.Flush(""); err != nil {
-		return nil, err
-	}
+	capture.reqTokens.side = "input"
+	capture.respTokens.side = "output"
 	return capture, nil
 }
 
@@ -407,7 +591,6 @@ func (c *Capture) ResponseBody(body io.ReadCloser, statusCode int, headers http.
 		return nil
 	}
 	c.ResponseMeta(statusCode, headers, isStream)
-	_ = c.Flush("")
 
 	return &captureReadCloser{
 		ReadCloser: body,
@@ -473,7 +656,7 @@ func (c *Capture) Flush(errorMessage string) error {
 	if err := c.store.Insert(ctx, ex); err != nil {
 		return err
 	}
-	return c.store.upsertCaptureTokens(ctx, ex.ID, c.reqTokens, c.respTokens, false)
+	return nil
 }
 
 func (c *Capture) Save(errorMessage string) error {
@@ -486,13 +669,20 @@ func (c *Capture) Save(errorMessage string) error {
 
 	c.lastFlush = time.Now().UTC()
 	ex := c.snapshotLocked(errorMessage, true)
+	reqPayload := c.reqTokens.Payload()
+	respPayload := c.respTokens.Payload()
 	c.mu.Unlock()
 
 	ctx := context.Background()
 	if err := c.store.Insert(ctx, ex); err != nil {
 		return err
 	}
-	return c.store.upsertCaptureTokens(ctx, ex.ID, c.reqTokens, c.respTokens, true)
+	c.store.enqueueTokenJob(tokenJob{
+		exchange: ex,
+		request:  reqPayload,
+		response: respPayload,
+	})
+	return nil
 }
 
 func (c *Capture) snapshotLocked(errorMessage string, final bool) Exchange {
@@ -506,32 +696,79 @@ func (c *Capture) snapshotLocked(errorMessage string, final bool) Exchange {
 	return c.ex
 }
 
-func (s *Store) upsertCaptureTokens(ctx context.Context, exchangeID string, reqTokens, respTokens *tokenCollector, final bool) error {
-	reqStats, err := reqTokens.Stats(final)
+type tokenJob struct {
+	exchange Exchange
+	request  tokenPayload
+	response tokenPayload
+}
+
+func (s *Store) startTokenWorker() {
+	s.tokenWG.Add(1)
+	go func() {
+		defer s.tokenWG.Done()
+		for job := range s.tokenJobs {
+			if err := s.processTokenJob(context.Background(), job); err != nil {
+				log.Printf("stalker: token processing failed for exchange %s: %v", job.exchange.ID, err)
+			}
+		}
+	}()
+}
+
+func (s *Store) enqueueTokenJob(job tokenJob) {
+	if s.tokenJobs == nil {
+		return
+	}
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.tokenJobs <- job:
+	default:
+		log.Printf("stalker: token queue full; applying backpressure")
+		s.tokenJobs <- job
+	}
+}
+
+func (s *Store) processTokenJob(ctx context.Context, job tokenJob) error {
+	ex := job.exchange
+	model := ex.Model
+	if model == "" {
+		model = job.request.Model()
+	}
+	if model != "" && ex.Model == "" {
+		if _, err := s.db.ExecContext(ctx, `UPDATE exchanges SET model = ? WHERE id = ? AND model = ''`, model, ex.ID); err != nil {
+			return err
+		}
+	}
+	reqStats, err := job.request.Stats(model)
 	if err != nil {
 		return err
 	}
-	if err := s.upsertTokenStats(ctx, exchangeID, "input", reqStats, final); err != nil {
+	if err := s.upsertTokenStats(ctx, ex.ID, "input", ex.Provider, model, reqStats, true); err != nil {
 		return err
 	}
-	respStats, err := respTokens.Stats(final)
+	respStats, err := job.response.Stats(model)
 	if err != nil {
 		return err
 	}
-	return s.upsertTokenStats(ctx, exchangeID, "output", respStats, final)
+	return s.upsertTokenStats(ctx, ex.ID, "output", ex.Provider, model, respStats, true)
 }
 
 func (s *Store) Insert(ctx context.Context, ex Exchange) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO exchanges (
-  id, started_at, completed_at, duration_ms, method, path, query, route,
+  id, started_at, completed_at, duration_ms, provider, model, method, path, query, route,
   target_url, chatgpt_auth, status_code, is_stream, error, request_headers,
   response_headers, request_body_path, response_body_path, request_preview,
   response_preview, request_bytes, response_bytes
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 	  completed_at = excluded.completed_at,
 	  duration_ms = excluded.duration_ms,
+	  provider = excluded.provider,
+	  model = excluded.model,
 	  status_code = excluded.status_code,
 	  is_stream = excluded.is_stream,
 	  error = excluded.error,
@@ -544,6 +781,8 @@ INSERT INTO exchanges (
 		ex.StartedAt.Format(time.RFC3339Nano),
 		ex.CompletedAt.Format(time.RFC3339Nano),
 		ex.DurationMS,
+		ex.Provider,
+		ex.Model,
 		ex.Method,
 		ex.Path,
 		ex.Query,
@@ -585,7 +824,7 @@ func (s *Store) List(ctx context.Context, filter ListFilter) ([]Exchange, error)
 	args = append(args, limit, offset)
 
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, started_at, completed_at, duration_ms, method, path, query, route,
+SELECT id, started_at, completed_at, duration_ms, provider, model, method, path, query, route,
   target_url, chatgpt_auth, status_code, is_stream, error, request_headers,
   response_headers, request_body_path, response_body_path, request_preview,
   response_preview, request_bytes, response_bytes
@@ -611,7 +850,7 @@ LIMIT ? OFFSET ?`, args...)
 
 func (s *Store) Get(ctx context.Context, id string) (Exchange, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, started_at, completed_at, duration_ms, method, path, query, route,
+SELECT id, started_at, completed_at, duration_ms, provider, model, method, path, query, route,
   target_url, chatgpt_auth, status_code, is_stream, error, request_headers,
   response_headers, request_body_path, response_body_path, request_preview,
   response_preview, request_bytes, response_bytes
@@ -665,6 +904,8 @@ func scanExchange(scanner exchangeScanner) (Exchange, error) {
 		&startedAt,
 		&completedAt,
 		&ex.DurationMS,
+		&ex.Provider,
+		&ex.Model,
 		&ex.Method,
 		&ex.Path,
 		&ex.Query,
@@ -691,6 +932,26 @@ func scanExchange(scanner exchangeScanner) (Exchange, error) {
 	ex.ChatGPTAuth = chatGPTAuth != 0
 	ex.IsStream = isStream != 0
 	return ex, nil
+}
+
+func providerFromRoute(route, targetURL string) string {
+	route = strings.ToLower(strings.TrimSpace(route))
+	switch {
+	case strings.HasPrefix(route, "openai-"):
+		return "openai"
+	case strings.HasPrefix(route, "chatgpt-"):
+		return "chatgpt"
+	}
+	if targetURL == "" {
+		return ""
+	}
+	if strings.Contains(targetURL, "api.openai.com") {
+		return "openai"
+	}
+	if strings.Contains(targetURL, "chatgpt.com") {
+		return "chatgpt"
+	}
+	return ""
 }
 
 func IsNotFound(err error) bool {

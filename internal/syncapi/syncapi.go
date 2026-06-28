@@ -19,6 +19,8 @@ func New(s *store.Store) *Handler {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
+	case "/api/v1/sync/health":
+		h.health(w, r)
 	case "/api/v1/sync/snapshot":
 		h.snapshot(w, r)
 	case "/api/v1/sync/stream":
@@ -26,6 +28,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
+	health, err := h.Store.SyncHealth(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, health)
 }
 
 func (h *Handler) snapshot(w http.ResponseWriter, r *http.Request) {
@@ -63,7 +74,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {

@@ -17,12 +17,25 @@ public struct SyncDevice: Codable, Equatable, Sendable, Identifiable {
     public var lastSeen: Date
 }
 
+public struct SyncHealth: Codable, Equatable, Sendable {
+    public var device: SyncDevice
+    public var generatedAt: Date
+    public var status: String
+    public var pendingTokenJobs: Int
+    public var tokenQueueSize: Int
+}
+
 public struct LiveStats: Codable, Equatable, Sendable {
     public var windowSeconds: Int
     public var inputTokens: Int64
     public var outputTokens: Int64
+    public var inputChars: Int64
+    public var outputChars: Int64
     public var requests: Int64
     public var errors: Int64
+    public var tokensPerSecond: Double
+    public var charactersPerSecond: Double
+    public var requestsPerMinute: Double
 }
 
 public struct StatsBucket: Codable, Equatable, Sendable, Identifiable {
@@ -31,20 +44,31 @@ public struct StatsBucket: Codable, Equatable, Sendable, Identifiable {
     public var start: Date
     public var inputTokens: Int64
     public var outputTokens: Int64
+    public var inputChars: Int64
+    public var outputChars: Int64
     public var requests: Int64
     public var errors: Int64
     public var streams: Int64
 
     public var id: String { key }
     public var totalTokens: Int64 { inputTokens + outputTokens }
+    public var totalChars: Int64 { inputChars + outputChars }
 }
 
 public struct TokenTotals: Codable, Equatable, Sendable {
     public var inputTokens: Int64
     public var outputTokens: Int64
+    public var inputChars: Int64
+    public var outputChars: Int64
+    public var inputWords: Int64
+    public var outputWords: Int64
     public var top: TokenBurns
+    public var topWords: TextBurns
+    public var topChars: TextBurns
 
     public var totalTokens: Int64 { inputTokens + outputTokens }
+    public var totalChars: Int64 { inputChars + outputChars }
+    public var totalWords: Int64 { inputWords + outputWords }
 }
 
 public struct TokenBurns: Codable, Equatable, Sendable {
@@ -54,11 +78,29 @@ public struct TokenBurns: Codable, Equatable, Sendable {
 
 public struct TokenBurn: Codable, Equatable, Sendable, Identifiable {
     public var side: String
+    public var provider: String
+    public var model: String
     public var token: String
     public var tokenHash: String
     public var occurrences: Int64
 
     public var id: String { side + ":" + tokenHash }
+}
+
+public struct TextBurns: Codable, Equatable, Sendable {
+    public var input: [TextBurn]
+    public var output: [TextBurn]
+}
+
+public struct TextBurn: Codable, Equatable, Sendable, Identifiable {
+    public var side: String
+    public var provider: String
+    public var model: String
+    public var value: String
+    public var valueHash: String
+    public var occurrences: Int64
+
+    public var id: String { side + ":" + valueHash }
 }
 
 public enum StalkerCoders {

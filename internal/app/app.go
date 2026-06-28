@@ -32,7 +32,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.URL.Path == "/api/exchanges" || strings.HasPrefix(r.URL.Path, "/api/exchanges/") ||
 		r.URL.Path == "/api/tokens/summary" || r.URL.Path == "/api/tokens/stream":
 		a.ui.ServeHTTP(w, r)
-	case r.URL.Path == "/api/v1/sync/snapshot" || r.URL.Path == "/api/v1/sync/stream":
+	case r.URL.Path == "/api/v1/sync/health" || r.URL.Path == "/api/v1/sync/snapshot" || r.URL.Path == "/api/v1/sync/stream":
 		a.syncapi.ServeHTTP(w, r)
 	default:
 		a.proxy.ServeHTTP(w, r)

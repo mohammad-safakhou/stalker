@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 
+#if os(macOS)
 @MainActor
 public final class StalkerProcessController: ObservableObject {
     public enum State: Equatable {
@@ -88,3 +89,39 @@ public final class StalkerProcessController: ObservableObject {
         }
     }
 }
+#else
+@MainActor
+public final class StalkerProcessController: ObservableObject {
+    public enum State: Equatable {
+        case unknown
+        case running
+        case stopped
+        case starting
+        case failed(String)
+    }
+
+    @Published public private(set) var state: State = .stopped
+
+    public init(client: StalkerAPIClient = StalkerAPIClient()) {}
+
+    public func refresh() async {}
+
+    public func start() {
+        state = .failed("Stalker process control is only available on macOS")
+    }
+
+    public func stop() {
+        state = .stopped
+    }
+
+    public var statusText: String {
+        switch state {
+        case .unknown: "Checking"
+        case .running: "Running"
+        case .stopped: "Unavailable"
+        case .starting: "Starting"
+        case .failed(let message): message
+        }
+    }
+}
+#endif

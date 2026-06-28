@@ -2,7 +2,7 @@ import StalkerShared
 import SwiftUI
 
 public struct StalkerWatchRootView: View {
-    @StateObject private var viewModel = StatsViewModel()
+    @StateObject private var viewModel = StatsViewModel(client: nil)
 
     public init() {}
 
@@ -16,6 +16,9 @@ public struct StalkerWatchRootView: View {
                     .font(.system(.largeTitle, design: .rounded).weight(.bold))
                 Text("tokens")
                     .foregroundStyle(.secondary)
+                Text("\(TokenFormat.compact(Int64(viewModel.snapshot?.live.tokensPerSecond.rounded() ?? 0)))/s")
+                    .font(.caption)
+                    .foregroundStyle(.green)
                 HStack {
                     VStack(alignment: .leading) {
                         Text("In").font(.caption2)
@@ -25,6 +28,17 @@ public struct StalkerWatchRootView: View {
                     VStack(alignment: .trailing) {
                         Text("Out").font(.caption2)
                         Text(TokenFormat.compact(viewModel.snapshot?.totals.outputTokens ?? 0))
+                    }
+                }
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text("Chars").font(.caption2)
+                        Text(TokenFormat.compact(viewModel.snapshot?.totals.totalChars ?? 0))
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing) {
+                        Text("Words").font(.caption2)
+                        Text(TokenFormat.compact(viewModel.snapshot?.totals.totalWords ?? 0))
                     }
                 }
             }

@@ -23,10 +23,16 @@ public struct StatsDashboardView: View {
                 TokenMetric(title: "Input", value: snapshot?.totals.inputTokens ?? 0, color: .teal)
                 TokenMetric(title: "Output", value: snapshot?.totals.outputTokens ?? 0, color: .purple)
             }
+            HStack(spacing: 12) {
+                TokenMetric(title: "Chars", value: snapshot?.totals.totalChars ?? 0, color: .orange)
+                TokenMetric(title: "Rate/s", value: Int64(snapshot?.live.tokensPerSecond.rounded() ?? 0), color: .green)
+            }
 
             BucketBars(title: "Today", buckets: snapshot?.hourly ?? [])
             TokenList(title: "Top input", tokens: snapshot?.totals.top.input ?? [])
             TokenList(title: "Top output", tokens: snapshot?.totals.top.output ?? [])
+            TextList(title: "Top words", values: snapshot?.totals.topWords.input ?? [])
+            TextList(title: "Top chars", values: snapshot?.totals.topChars.input ?? [])
         }
         .padding()
     }
@@ -85,6 +91,25 @@ private struct TokenList: View {
                     Text(token.token).lineLimit(1)
                     Spacer()
                     Text(TokenFormat.compact(token.occurrences)).foregroundStyle(.secondary)
+                }
+                .font(.callout.monospaced())
+            }
+        }
+    }
+}
+
+private struct TextList: View {
+    let title: String
+    let values: [TextBurn]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.headline)
+            ForEach(values.prefix(5)) { value in
+                HStack {
+                    Text(value.value).lineLimit(1)
+                    Spacer()
+                    Text(TokenFormat.compact(value.occurrences)).foregroundStyle(.secondary)
                 }
                 .font(.callout.monospaced())
             }

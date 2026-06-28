@@ -129,7 +129,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if isUpgradeResponse(resp) {
 				if capture != nil {
 					capture.ResponseMeta(resp.StatusCode, resp.Header, true)
-					_ = capture.Save("")
 				}
 				return nil
 			}
@@ -187,7 +186,6 @@ func (p *Proxy) serveWebSocket(w http.ResponseWriter, r *http.Request, plan rout
 			headers = resp.Header
 		}
 		capture.ResponseMeta(http.StatusSwitchingProtocols, headers, true)
-		_ = capture.Flush("")
 	}
 
 	subprotocols := []string(nil)
@@ -247,7 +245,6 @@ func relayWebSocket(src, dst *websocket.Conn, side string, capture *store.Captur
 			} else {
 				capture.WriteResponse(frame)
 			}
-			_ = capture.Flush("")
 		}
 		if err := dst.WriteMessage(messageType, payload); err != nil {
 			errc <- err

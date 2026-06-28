@@ -44,6 +44,7 @@ func TestSyncSnapshotBuildsBucketsFromTokenRuns(t *testing.T) {
 	if err := respBody.Close(); err != nil {
 		t.Fatal(err)
 	}
+	waitForTokenRuns(t, s, capture.ex.ID, 2)
 
 	snapshot, err := s.SyncSnapshot(context.Background())
 	if err != nil {
